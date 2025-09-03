@@ -203,8 +203,8 @@ wandb/
 mlruns/
 lightning_logs/
 
-# Jupyter notebook outputs
-*.ipynb
+# # Jupyter notebook outputs
+# *.ipynb
 
 # Configuration files with sensitive data
 config.ini
