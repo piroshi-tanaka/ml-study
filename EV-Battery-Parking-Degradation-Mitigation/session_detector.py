@@ -36,7 +36,7 @@ import pandas as pd
 from dataclasses import dataclass
 from typing import Optional, Any, Dict, List
 from enum import Enum
-from sklearn.metrics.pairwise import haversine_distances  # type: ignore
+from geopy.distance import geodesic  # type: ignore
 
 
 # ======================
@@ -97,19 +97,18 @@ class SessionParams:
 # ======================
 # ユーティリティ関数
 # ======================
-def calculate_haversine_distance(
+def calculate_geodesic_distance(
     lat1: float, lon1: float, lat2: float, lon2: float
 ) -> float:
     """
-    地球上の2点間の距離をハバーサイン公式で計算
+    地球上の2点間の距離をgeodetic距離で計算
     
     【目的】
     GPS座標から車両の移動距離を正確に算出するため。
     地球の球面性を考慮した距離計算が必要。
     
     【使用ライブラリ】
-    sklearnのhaversine_distances: 最適化済み・テスト済みの実装を使用
-    自前実装より精度・パフォーマンスが優秀
+    geopyのgeodesic: 高精度・効率的な地球上距離計算
     
     Args:
         lat1, lon1: 開始点の緯度・経度（度単位）
@@ -135,20 +134,15 @@ def calculate_haversine_distance(
         return 0.0
 
     try:
-        # sklearn用にデータを準備: 度をラジアンに変換し、配列形式にする
-        # sklearnのhaversine_distancesは入力をラジアン単位で期待
-        point1 = np.array([[np.deg2rad(lat1), np.deg2rad(lon1)]])
-        point2 = np.array([[np.deg2rad(lat2), np.deg2rad(lon2)]])
+        # geopyで2点間の距離を計算
+        point1 = (lat1, lon1)
+        point2 = (lat2, lon2)
+        
+        # geodesicで距離計算（メートル単位で返る）
+        distance = geodesic(point1, point2).meters
+        return float(distance)
 
-        # ハバーサイン距離を計算
-        # 戻り値は正規化された距離（ラジアン単位の中心角）
-        distance_rad = haversine_distances(point1, point2)[0, 0]
-
-        # 地球半径を掛けて実際の距離（メートル）に変換
-        # 地球半径: 約6,371km = 6,371,000m
-        return distance_rad * 6_371_000.0
-
-    except (ValueError, IndexError, TypeError):
+    except (ValueError, TypeError):
         # 計算エラー時は安全に0を返す
         # 例: 極端な座標値、数値変換エラーなど
         return 0.0
@@ -170,7 +164,7 @@ def calculate_distance_prev(df: pd.DataFrame) -> pd.Series:
     
     Args:
         df: 時系列順にソートされたDataFrame
-            必須カラム: hashvin, tsu_latitude, tsu_longitude
+            必須カラム: hashvin, tsu_rawgnss_latitude, tsu_rawgnss_longitude
             
     Returns:
         pd.Series: 各行の前観測点からの移動距離（メートル）
@@ -191,12 +185,12 @@ def calculate_distance_prev(df: pd.DataFrame) -> pd.Series:
         # 同じ車両（hashvin）の場合のみ距離計算を実行
         # 異なる車両間の距離は意味がないため0とする
         if row["hashvin"] == prev_row["hashvin"]:
-            # ハバーサイン公式で前の位置からの移動距離を計算
-            dist = calculate_haversine_distance(
-                prev_row["tsu_latitude"],
-                prev_row["tsu_longitude"],
-                row["tsu_latitude"],
-                row["tsu_longitude"],
+            # geodesic距離で前の位置からの移動距離を計算
+            dist = calculate_geodesic_distance(
+                prev_row["tsu_rawgnss_latitude"],
+                prev_row["tsu_rawgnss_longitude"],
+                row["tsu_rawgnss_latitude"],
+                row["tsu_rawgnss_longitude"],
             )
             distances.append(dist)
         else:
@@ -243,6 +237,11 @@ def preprocess_data(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
     d.loc[d["soc"] < 0, "soc"] = np.nan      # 負の値は物理的に不可能
     d.loc[d["soc"] > 100, "soc"] = np.nan    # 100%超過は異常値
 
+    # === 時系列データ変換 ===
+    # 時刻列をdatetime型に変換
+    d["tsu_current_time"] = pd.to_datetime(d["tsu_current_time"])
+    d["tsu_igon_time"] = pd.to_datetime(d["tsu_igon_time"], errors='coerce')
+    
     # === 時系列ソート（重要）===
     # セッション判定は前の状態との比較が必要なため、時系列順が必須
     d = d.sort_values(["hashvin", "tsu_current_time"]).reset_index(drop=True)
@@ -250,7 +249,7 @@ def preprocess_data(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
     # === Step1: 充電セッション判定 ===
     # 基本充電モード判定: charge_modeの値から充電状態を判定
     d["is_charge_mode"] = d["charge_mode"].isin(
-        ["100V charging", "200V charging", "Fast charging"]
+        ["100v charging", "200v charging", "Fast charging"]
     )
     
     # 初期充電判定: まずはcharge_modeベースで設定
@@ -278,12 +277,7 @@ def preprocess_data(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
                     current_soc >= prev_soc):
                     d.loc[current_idx, "is_charging"] = True
 
-    # === Step2: IG-ON/OFF状態判定 ===
-    # IG-ON判定: tsu_igon_timeフィールドの存在・有効性で判定
-    # 【注意】単純なnotna()だけでは不十分（空文字列も除外必要）
-    d["is_igon"] = d["tsu_igon_time"].notna() & (d["tsu_igon_time"] != "")
-    
-    # IGONタイム変更イベントの検出
+    # === Step2: IGONタイム変更イベントの検出 ===
     # 【目的】車両のIG-ON状態変化を捉える（ユーザーの行動変化を示す）
     # 【処理】hashvinごとにtsu_igon_timeの値が前行から変化した場合を検出
     d["igon_change"] = (
@@ -293,7 +287,7 @@ def preprocess_data(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
     )
 
     # === Step3: 移動距離計算 ===
-    # 前観測点からの移動距離を計算（ハバーサイン公式使用）
+    # 前観測点からの移動距離を計算（geodesic距離使用）
     d["distance_prev_m"] = calculate_distance_prev(d)
     
     # 移動判定: 設定閾値以上の距離移動があった場合
@@ -321,56 +315,11 @@ def determine_session_type(df: pd.DataFrame) -> pd.DataFrame:
     
     【出力】
     - session_type: 主要セッションタイプ
-    - boundary_events: 境界イベント詳細（パイプ区切り）
-    - has_boundary: 境界イベント有無フラグ
     - is_inactive: 放置状態統合フラグ
     - inactive関連フラグ: 放置セッションの詳細情報
     """
     d = df.copy()
 
-    # === 境界情報の詳細保持 ===
-    # 【課題】セッション境界で「充電終了」と「移動開始」が同時発生する場合、
-    #         どちらの情報も必要だが、単一のsession_typeでは表現困難
-    # 【解決】境界イベントを別列で詳細に記録し、主セッションと分離
-    
-    # セッション開始フラグ一覧
-    start_flags = [
-        "charge_start_flag",      # 充電開始
-        "movement_start_flag",    # 移動開始
-        "idling_start_flag",      # アイドリング開始
-        "parking_start_flag",     # パーキング開始
-        "inactive_start_flag",    # 放置開始（統合）
-    ]
-    
-    # セッション終了フラグ一覧
-    end_flags = [
-        "charge_end_flag",        # 充電終了
-        "movement_end_flag",      # 移動終了
-        "idling_end_flag",        # アイドリング終了
-        "parking_end_flag",       # パーキング終了
-        "inactive_end_flag",      # 放置終了（統合）
-    ]
-
-    # 各行の境界イベントを文字列として記録
-    # 例: "charge_end|movement_start" （充電終了と移動開始が同時）
-    boundary_info = []
-    for _, row in d.iterrows():
-        boundaries = []
-        
-        # 開始イベントを記録
-        for flag in start_flags:
-            if flag in d.columns and row.get(flag, False):
-                boundaries.append(flag.replace("_flag", ""))  # "_flag"を除去
-                
-        # 終了イベントを記録  
-        for flag in end_flags:
-            if flag in d.columns and row.get(flag, False):
-                boundaries.append(flag.replace("_flag", ""))  # "_flag"を除去
-                
-        # パイプ区切りで連結、何もなければNone
-        boundary_info.append("|".join(boundaries) if boundaries else None)
-
-    d["boundary_events"] = boundary_info
 
     # === 主要セッションタイプの決定 ===
     # 【方針】境界イベントがあっても、その行の主要な状態を明確にする
@@ -428,10 +377,6 @@ def determine_session_type(df: pd.DataFrame) -> pd.DataFrame:
     # 【用途】放置期間の集計や分析時のグループ化に使用
     d["inactive_session_id"] = d.groupby("hashvin")["inactive_start_flag"].cumsum()
 
-    # 境界イベント有無フラグ: 分析時の便利フラグ
-    # 【用途】セッション境界の行を簡単に抽出可能
-    d["has_boundary"] = d["boundary_events"].notna()
-
     return d
 
 
@@ -475,6 +420,8 @@ def extract_charge_to_inactive_sessions(
                     charge_start_idx, "tsu_current_time"
                 ],
                 "charge_start_idx": charge_start_idx,
+                "charge_start_lat": vehicle_data.loc[charge_start_idx, "tsu_rawgnss_latitude"],
+                "charge_start_lon": vehicle_data.loc[charge_start_idx, "tsu_rawgnss_longitude"],
             }
 
             # 充電終了を探す
@@ -489,6 +436,8 @@ def extract_charge_to_inactive_sessions(
             session_info["charge_end_time"] = vehicle_data.loc[
                 charge_end_idx, "tsu_current_time"
             ]
+            session_info["charge_end_lat"] = vehicle_data.loc[charge_end_idx, "tsu_rawgnss_latitude"]
+            session_info["charge_end_lon"] = vehicle_data.loc[charge_end_idx, "tsu_rawgnss_longitude"]
 
             # 充電後の移動・放置を探す
             after_charge = vehicle_data[vehicle_data.index > charge_end_idx]
@@ -503,6 +452,8 @@ def extract_charge_to_inactive_sessions(
                 session_info["inactive_start_time"] = vehicle_data.loc[
                     inactive_start_idx, "tsu_current_time"
                 ]
+                session_info["inactive_start_lat"] = vehicle_data.loc[inactive_start_idx, "tsu_rawgnss_latitude"]
+                session_info["inactive_start_lon"] = vehicle_data.loc[inactive_start_idx, "tsu_rawgnss_longitude"]
 
                 # 放置終了を探す
                 after_inactive_start = vehicle_data[
@@ -516,6 +467,8 @@ def extract_charge_to_inactive_sessions(
                     session_info["session_end_time"] = vehicle_data.loc[
                         inactive_end_idx, "tsu_current_time"
                     ]
+                    session_info["inactive_end_lat"] = vehicle_data.loc[inactive_end_idx, "tsu_rawgnss_latitude"]
+                    session_info["inactive_end_lon"] = vehicle_data.loc[inactive_end_idx, "tsu_rawgnss_longitude"]
 
                     # 各セッションの時間計算
                     charge_duration = (
@@ -590,36 +543,6 @@ def extract_charge_to_inactive_sessions(
     return pd.DataFrame(result_sessions)
 
 
-def get_session_data_by_boundary(
-    df: pd.DataFrame, boundary_type: str, session_id: Optional[int] = None
-) -> pd.DataFrame:
-    """
-    特定の境界イベントに関連するデータを抽出
-
-    Args:
-        df: セッション判定済みデータ
-        boundary_type: 'charge_end', 'movement_start', 'parking_start' など
-        session_id: 特定のセッションID（オプション）
-
-    Returns:
-        境界イベントを含む行のデータ
-    """
-    # 境界イベントがある行を抽出
-    boundary_mask = df["boundary_events"].notna() & df["boundary_events"].str.contains(
-        boundary_type, na=False
-    )
-
-    result = df[boundary_mask].copy()
-
-    if session_id is not None:
-        # 特定のセッションIDに関連する行のみ
-        session_col = boundary_type.split("_")[0] + "_session_id"
-        if session_col in result.columns:
-            result = result[result[session_col] == session_id]
-
-    return result
-
-
 # ======================
 # 充電セッション処理
 # ======================
@@ -657,11 +580,11 @@ def stitch_charging_sessions(df: pd.DataFrame, params: SessionParams) -> pd.Data
                             g.loc[next_charge_idx, "tsu_current_time"]
                             - row["tsu_current_time"]
                         ).total_seconds() / 60.0
-                        dist_gap = calculate_haversine_distance(
-                            row["tsu_latitude"],
-                            row["tsu_longitude"],
-                            g.loc[next_charge_idx, "tsu_latitude"],
-                            g.loc[next_charge_idx, "tsu_longitude"],
+                        dist_gap = calculate_geodesic_distance(
+                            row["tsu_rawgnss_latitude"],
+                            row["tsu_rawgnss_longitude"],
+                            g.loc[next_charge_idx, "tsu_rawgnss_latitude"],
+                            g.loc[next_charge_idx, "tsu_rawgnss_longitude"],
                         )
 
                         # ギャップが許容範囲内なら継続
@@ -722,47 +645,23 @@ def stitch_charging_sessions(df: pd.DataFrame, params: SessionParams) -> pd.Data
 # セッション判定メイン処理
 # ======================
 def determine_sessions(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
-    """Step4-6: 各セッションの判定"""
+    """Step4-6: 各セッションの判定（優先度: parking→moving→idling）"""
+    # paramsは将来の拡張用に保持
+    _ = params  # 未使用警告を回避
     d = df.copy()
 
-    # Step4: 移動中セッション判定
-    d["is_moving"] = d["is_igon"] & ~d["is_charging_stitched"] & d["is_moving_distance"]
+    # 初期化：すべてのセッションフラグをFalseに設定
+    d["is_parking"] = False
+    d["is_moving"] = False  
+    d["is_idling"] = False
 
-    d["movement_start_flag"] = (
-        d.groupby("hashvin")["is_moving"]
-        .transform(lambda s: s & ~s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-
-    d["movement_end_flag"] = (
-        d.groupby("hashvin")["is_moving"]
-        .transform(lambda s: ~s & s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-
-    d["movement_session_id"] = d.groupby("hashvin")["movement_start_flag"].cumsum()
-
-    # Step5: アイドリングセッション判定
-    d["is_idling"] = (
-        d["is_igon"] & ~d["is_charging_stitched"] & ~d["is_moving_distance"]
-    )
-
-    d["idling_start_flag"] = (
-        d.groupby("hashvin")["is_idling"]
-        .transform(lambda s: s & ~s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-
-    d["idling_end_flag"] = (
-        d.groupby("hashvin")["is_idling"]
-        .transform(lambda s: ~s & s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-
-    d["idling_session_id"] = d.groupby("hashvin")["idling_start_flag"].cumsum()
-
-    # Step6: パーキングセッション判定
-    d["is_parking"] = ~d["is_igon"] & ~d["is_charging_stitched"]
+    # Step4: パーキングセッション判定（最優先）
+    # IG-OFF状態かつ充電中でない場合にパーキング
+    d.loc[
+        (d["tsu_igon_time"].isna() | (d["tsu_igon_time"] == "")) & 
+        ~d["is_charging_stitched"], 
+        "is_parking"
+    ] = True
 
     d["parking_start_flag"] = (
         d.groupby("hashvin")["is_parking"]
@@ -778,6 +677,54 @@ def determine_sessions(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
 
     d["parking_session_id"] = d.groupby("hashvin")["parking_start_flag"].cumsum()
 
+    # Step5: 移動中セッション判定（パーキング次点）
+    # IG-ON、充電中でない、パーキング中でない、かつ移動距離がある場合
+    d.loc[
+        (d["tsu_igon_time"].notna() & (d["tsu_igon_time"] != "")) &
+        ~d["is_charging_stitched"] & 
+        ~d["is_parking"] & 
+        d["is_moving_distance"], 
+        "is_moving"
+    ] = True
+
+    d["movement_start_flag"] = (
+        d.groupby("hashvin")["is_moving"]
+        .transform(lambda s: s & ~s.shift(1, fill_value=False))
+        .fillna(False)
+    )
+
+    d["movement_end_flag"] = (
+        d.groupby("hashvin")["is_moving"]
+        .transform(lambda s: ~s & s.shift(1, fill_value=False))
+        .fillna(False)
+    )
+
+    d["movement_session_id"] = d.groupby("hashvin")["movement_start_flag"].cumsum()
+
+    # Step6: アイドリングセッション判定（最低優先度）
+    # IG-ON、充電中でない、パーキング中でない、移動中でない場合
+    d.loc[
+        (d["tsu_igon_time"].notna() & (d["tsu_igon_time"] != "")) &
+        ~d["is_charging_stitched"] & 
+        ~d["is_parking"] & 
+        ~d["is_moving"], 
+        "is_idling"
+    ] = True
+
+    d["idling_start_flag"] = (
+        d.groupby("hashvin")["is_idling"]
+        .transform(lambda s: s & ~s.shift(1, fill_value=False))
+        .fillna(False)
+    )
+
+    d["idling_end_flag"] = (
+        d.groupby("hashvin")["is_idling"]
+        .transform(lambda s: ~s & s.shift(1, fill_value=False))
+        .fillna(False)
+    )
+
+    d["idling_session_id"] = d.groupby("hashvin")["idling_start_flag"].cumsum()
+
     return d
 
 
@@ -787,36 +734,49 @@ def determine_sessions(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
 def check_no_movement_after_charge(
     df: pd.DataFrame, params: SessionParams
 ) -> pd.DataFrame:
-    """Step7: 充電後移動なし放置判定"""
+    """Step7: 充電後移動なし放置判定（改訂版）"""
     d = df.copy()
     d["is_no_move_after_charge"] = False
 
     for _, g in d.groupby("hashvin", sort=False):
         g = g.copy()
-        charge_end_indices = g[g["charge_end_flag"]].index
+        charge_start_indices = g[g["charge_start_flag"]].index
 
-        for ce_idx in charge_end_indices:
-            ce_time = g.loc[ce_idx, "tsu_current_time"]
-            window_end = ce_time + pd.Timedelta(minutes=params.WINDOW_min)
-
-            # ウィンドウ内のデータを取得
-            window_data = g[
-                (g["tsu_current_time"] > ce_time)
-                & (g["tsu_current_time"] <= window_end)
-            ]
-
-            if len(window_data) == 0:
-                continue
-
-            # ウィンドウ内の累積移動距離をチェック
-            total_distance = window_data["distance_prev_m"].sum()
-
-            if total_distance <= params.DIST_TH_m:
-                # 移動なしと判定 - 後続の放置セッション（inactive = idle + parking）をマーク
-                # 【修正】parkingだけでなく、idlingも含めて放置状態全体を対象とする
-                inactive_data = window_data[window_data["is_idling"] | window_data["is_parking"]]
-                if len(inactive_data) > 0:
-                    d.loc[inactive_data.index, "is_no_move_after_charge"] = True
+        for cs_idx in charge_start_indices:
+            # 充電開始後の次の移動開始を探す
+            after_charge_start = g[g.index > cs_idx]
+            movement_start_mask = after_charge_start["movement_start_flag"]
+            
+            if movement_start_mask.any():
+                # 次の移動開始が見つかった場合
+                next_movement_idx = after_charge_start[movement_start_mask].index[0]
+                
+                # 充電開始から次の移動開始までのデータを取得
+                between_data = g[
+                    (g.index >= cs_idx) & (g.index < next_movement_idx)
+                ]
+                
+                # この期間の最大移動距離をチェック
+                if len(between_data) > 0:
+                    max_distance = between_data["distance_prev_m"].max()
+                    
+                    if max_distance <= params.DIST_TH_m:
+                        # 移動なしと判定 - この期間の放置セッション（inactive = idle + parking）をマーク
+                        inactive_data = between_data[between_data["is_idling"] | between_data["is_parking"]]
+                        if len(inactive_data) > 0:
+                            d.loc[inactive_data.index, "is_no_move_after_charge"] = True
+            else:
+                # 次の移動開始が見つからない場合、充電開始後の全データをチェック
+                after_charge_data = g[g.index > cs_idx]
+                
+                if len(after_charge_data) > 0:
+                    max_distance = after_charge_data["distance_prev_m"].max()
+                    
+                    if max_distance <= params.DIST_TH_m:
+                        # 移動なしと判定 - 充電開始後の放置セッションをマーク
+                        inactive_data = after_charge_data[after_charge_data["is_idling"] | after_charge_data["is_parking"]]
+                        if len(inactive_data) > 0:
+                            d.loc[inactive_data.index, "is_no_move_after_charge"] = True
 
     return d
 
@@ -871,7 +831,7 @@ def detect_sessions(
 
     入力:
         df: 時系列データ (hashvin, tsu_current_time, tsu_igon_time,
-                        tsu_latitude, tsu_longitude, soc, charge_mode)
+                        tsu_rawgnss_latitude, tsu_rawgnss_longitude, soc, charge_mode)
         params: セッション判定パラメータ
 
     出力:
@@ -1053,7 +1013,7 @@ def extract_session_details(df: pd.DataFrame) -> pd.DataFrame:
                 
             # 開始イベントの処理
             start_events = vehicle_data[vehicle_data[start_flag]].copy()
-            for idx, row in start_events.iterrows():
+            for _, row in start_events.iterrows():
                 result_data.append({
                     'hashvin': hashvin,
                     'session_type': session_type,
@@ -1062,8 +1022,8 @@ def extract_session_details(df: pd.DataFrame) -> pd.DataFrame:
                     'timestamp': row['tsu_current_time'],
                     'soc': row['soc'],
                     'distance_from_prev': row.get('distance_prev_m', 0),
-                    'latitude': row.get('tsu_latitude'),
-                    'longitude': row.get('tsu_longitude'),
+                    'latitude': row.get('tsu_rawgnss_latitude'),
+                    'longitude': row.get('tsu_rawgnss_longitude'),
                     'duration_min': None,
                     'soc_diff': None,
                     'total_distance': None
@@ -1071,7 +1031,7 @@ def extract_session_details(df: pd.DataFrame) -> pd.DataFrame:
             
             # 終了イベントの処理
             end_events = vehicle_data[vehicle_data[end_flag]].copy()
-            for idx, row in end_events.iterrows():
+            for _, row in end_events.iterrows():
                 # 対応する開始イベントを探す
                 session_id = row[session_id_col]
                 session_data = vehicle_data[
@@ -1105,8 +1065,8 @@ def extract_session_details(df: pd.DataFrame) -> pd.DataFrame:
                     'timestamp': row['tsu_current_time'],
                     'soc': row['soc'],
                     'distance_from_prev': row.get('distance_prev_m', 0),
-                    'latitude': row.get('tsu_latitude'),
-                    'longitude': row.get('tsu_longitude'),
+                    'latitude': row.get('tsu_rawgnss_latitude'),
+                    'longitude': row.get('tsu_rawgnss_longitude'),
                     'duration_min': duration_min,
                     'soc_diff': soc_diff,
                     'total_distance': total_distance
@@ -1119,7 +1079,7 @@ def extract_session_details(df: pd.DataFrame) -> pd.DataFrame:
         if 'inactive_start_flag' in vehicle_data.columns and 'inactive_end_flag' in vehicle_data.columns:
             # 放置開始イベント
             inactive_starts = vehicle_data[vehicle_data['inactive_start_flag']].copy()
-            for idx, row in inactive_starts.iterrows():
+            for _, row in inactive_starts.iterrows():
                 # 放置の内訳を判定
                 breakdown = []
                 if row.get('is_idling', False):
@@ -1135,8 +1095,8 @@ def extract_session_details(df: pd.DataFrame) -> pd.DataFrame:
                     'timestamp': row['tsu_current_time'],
                     'soc': row['soc'],
                     'distance_from_prev': row.get('distance_prev_m', 0),
-                    'latitude': row.get('tsu_latitude'),
-                    'longitude': row.get('tsu_longitude'),
+                    'latitude': row.get('tsu_rawgnss_latitude'),
+                    'longitude': row.get('tsu_rawgnss_longitude'),
                     'duration_min': None,
                     'soc_diff': None,
                     'total_distance': None,
@@ -1145,7 +1105,7 @@ def extract_session_details(df: pd.DataFrame) -> pd.DataFrame:
             
             # 放置終了イベント
             inactive_ends = vehicle_data[vehicle_data['inactive_end_flag']].copy()
-            for idx, row in inactive_ends.iterrows():
+            for _, row in inactive_ends.iterrows():
                 session_id = row.get('inactive_session_id', 0)
                 
                 # セッション期間データを取得
@@ -1186,8 +1146,8 @@ def extract_session_details(df: pd.DataFrame) -> pd.DataFrame:
                     'timestamp': row['tsu_current_time'],
                     'soc': row['soc'],
                     'distance_from_prev': row.get('distance_prev_m', 0),
-                    'latitude': row.get('tsu_latitude'),
-                    'longitude': row.get('tsu_longitude'),
+                    'latitude': row.get('tsu_rawgnss_latitude'),
+                    'longitude': row.get('tsu_rawgnss_longitude'),
                     'duration_min': duration_min,
                     'soc_diff': soc_diff,
                     'total_distance': total_distance,
