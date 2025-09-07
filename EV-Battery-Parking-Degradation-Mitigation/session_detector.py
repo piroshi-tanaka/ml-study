@@ -1,4 +1,6 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# vim: set fileencoding=utf-8 :
 """
 EVバッテリー駐車劣化軽減のための5セッション判定モジュール
 ====================================================
@@ -71,12 +73,10 @@ class SessionParams:
 
     # 移動判定関連
     DIST_TH_m: float = 150.0        # 移動判定距離閾値（メートル）
-                                    # この距離以上移動した場合に「移動中」と判定
-                                    
+                                    # この距離以上移動した場合に「移動中」と判定      
     # 充電判定関連
     SOC_TH_pct: float = 5.0         # SOC変化閾値（パーセント）
                                     # 充電判定時のSOC変化の最小値
-                                    
     # 放置時間分類
     PARK_TH_min: float = 360.0      # 長時間放置閾値（分）= 6時間
                                     # この時間以上の放置を「長時間放置」として分析対象
@@ -84,14 +84,9 @@ class SessionParams:
                                     # 短時間放置の上限値
     LONG_PARK_min: float = 360.0    # 長時間放置下限（分）= 6時間
                                     # 長時間放置の下限値（PARK_TH_minと同値）
-                                    
     # セッション連結処理
     GAP_MAX_min: float = 15.0       # 充電ギャップ許容時間（分）
                                     # この時間内の充電中断は同一充電セッションとして扱う
-                                    
-    # 充電後移動判定
-    WINDOW_min: float = 60.0        # 充電後移動チェック時間窓（分）
-                                    # 充電終了後この時間内での移動有無をチェック
 
 
 # ======================
@@ -148,59 +143,6 @@ def calculate_geodesic_distance(
         return 0.0
 
 
-def calculate_distance_prev(df: pd.DataFrame) -> pd.Series:
-    """
-    各観測点について、前の観測点からの移動距離を計算
-    
-    【目的】
-    時系列データで車両がどれだけ移動したかを把握し、
-    移動セッションと停止セッションを区別するため。
-    
-    【処理ロジック】
-    1. 最初の行は距離0（比較対象なし）
-    2. 同一車両（hashvin）内でのみ距離計算
-    3. 車両が変わった場合は距離0（別車両との比較は無意味）
-    4. ハバーサイン公式で正確な地球上距離を計算
-    
-    Args:
-        df: 時系列順にソートされたDataFrame
-            必須カラム: hashvin, tsu_rawgnss_latitude, tsu_rawgnss_longitude
-            
-    Returns:
-        pd.Series: 各行の前観測点からの移動距離（メートル）
-                   最初の行や車両変更時は0.0
-    """
-    distances = []
-
-    for i in range(len(df)):
-        # 最初の行は比較対象がないため距離0
-        if i == 0:
-            distances.append(0.0)
-            continue
-
-        # 現在行と前行のデータを取得
-        row = df.iloc[i]
-        prev_row = df.iloc[i - 1]
-
-        # 同じ車両（hashvin）の場合のみ距離計算を実行
-        # 異なる車両間の距離は意味がないため0とする
-        if row["hashvin"] == prev_row["hashvin"]:
-            # geodesic距離で前の位置からの移動距離を計算
-            dist = calculate_geodesic_distance(
-                prev_row["tsu_rawgnss_latitude"],
-                prev_row["tsu_rawgnss_longitude"],
-                row["tsu_rawgnss_latitude"],
-                row["tsu_rawgnss_longitude"],
-            )
-            distances.append(dist)
-        else:
-            # 車両が変わった場合は距離0
-            distances.append(0.0)
-
-    # 元のDataFrameのインデックスを保持してSeriesとして返す
-    return pd.Series(distances, index=df.index)
-
-
 # ======================
 # 前処理
 # ======================
@@ -255,27 +197,32 @@ def preprocess_data(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
     # 初期充電判定: まずはcharge_modeベースで設定
     d["is_charging"] = d["is_charge_mode"].fillna(False).astype(bool)
     
-    # === 重要: SOC条件による充電判定の補正 ===
+    # === 重要: SOC条件による充電判定の補正（最適化版）===
     # 【課題】charge_modeがFalseでも実際は充電継続している場合がある
     # 【解決】前行がcharge_mode=Trueで現行がFalseの場合、SOC変化で判定
-    for _, g in d.groupby("hashvin", sort=False):
-        g = g.copy()
-        for i in range(1, len(g)):
-            current_idx = g.index[i]
-            prev_idx = g.index[i-1]
-            
-            # 条件: 前行が充電中、現行が充電モードoff
-            if (d.loc[prev_idx, "is_charge_mode"] and 
-                not d.loc[current_idx, "is_charge_mode"]):
-                
-                prev_soc = d.loc[prev_idx, "soc"]
-                current_soc = d.loc[current_idx, "soc"]
-                
-                # SOCが維持or増加している場合は充電継続と判定
-                # 理由: 充電中はSOCが減少することはないため
-                if (pd.notna(prev_soc) and pd.notna(current_soc) and 
-                    current_soc >= prev_soc):
-                    d.loc[current_idx, "is_charging"] = True
+    # 【最適化】shift()を使ってベクトル化処理
+    
+    # hashvinごとに前行のcharge_modeとSOCを取得
+    d["prev_is_charge_mode"] = d.groupby("hashvin")["is_charge_mode"].shift(1)
+    d["prev_soc"] = d.groupby("hashvin")["soc"].shift(1)
+    
+    # 補正条件を定義
+    # 1. 前行が充電中で現行が充電モードoff
+    # 2. 前行と現行のSOCが両方とも有効
+    # 3. SOCが維持または増加している
+    correction_condition = (
+        d["prev_is_charge_mode"].fillna(False) &  # 前行が充電中
+        ~d["is_charge_mode"] &                     # 現行が充電モードoff
+        d["prev_soc"].notna() &                    # 前行SOCが有効
+        d["soc"].notna() &                         # 現行SOCが有効
+        (d["soc"] >= d["prev_soc"])                # SOCが維持or増加
+    )
+    
+    # 条件に合致する行を充電継続と判定
+    d.loc[correction_condition, "is_charging"] = True
+    
+    # 一時的な列を削除（メモリ節約）
+    d.drop(["prev_is_charge_mode", "prev_soc"], axis=1, inplace=True)
 
     # === Step2: IGONタイム変更イベントの検出 ===
     # 【目的】車両のIG-ON状態変化を捉える（ユーザーの行動変化を示す）
@@ -286,13 +233,483 @@ def preprocess_data(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
         .fillna(False)  # 最初の行はFalse（比較対象なし）
     )
 
-    # === Step3: 移動距離計算 ===
+    # === Step3: 移動距離計算（高速化版）===
     # 前観測点からの移動距離を計算（geodesic距離使用）
-    d["distance_prev_m"] = calculate_distance_prev(d)
+    # 【高速化ポイント】
+    # 1. hashvinごとにグループ化してshift()で前行データを取得
+    # 2. 有効データのみ効率的に計算（無駄な計算を排除）
+    # 3. 車両変更時は自動的に距離0（shift結果がNaNになるため）
+    
+    # hashvinごとに前行の緯度・経度を取得
+    # d["prev_lat"] = d.groupby("hashvin")["tsu_rawgnss_latitude"].shift(1)
+    # d["prev_lon"] = d.groupby("hashvin")["tsu_rawgnss_longitude"].shift(1)
+    
+    # # 初期化：すべて0.0で開始
+    # d["distance_prev_m"] = 0.0
+    
+    # # NaN（最初の行や車両変更時）以外で有効な前行データがある行を抽出
+    # valid_prev = d["prev_lat"].notna() & d["prev_lon"].notna()
+    
+    # # 有効な前行データがある行のみ距離計算
+    # if valid_prev.any():
+    #     # apply()を使って効率的に距離計算
+    #     def calc_distance_row(row):
+    #         return calculate_geodesic_distance(
+    #             row["prev_lat"],
+    #             row["prev_lon"],
+    #             row["tsu_rawgnss_latitude"],
+    #             row["tsu_rawgnss_longitude"]
+    #         )
+        
+    #     d.loc[valid_prev, "distance_prev_m"] = d[valid_prev].apply(calc_distance_row, axis=1)
+    
+    # # 一時的な列を削除（メモリ節約）
+    # d.drop(["prev_lat", "prev_lon"], axis=1, inplace=True)
     
     # 移動判定: 設定閾値以上の距離移動があった場合
     # 【理由】GPS誤差やわずかな位置ずれを移動と誤認しないため
     d["is_moving_distance"] = d["distance_prev_m"] > params.DIST_TH_m
+    return d
+
+
+# ======================
+# 充電セッション処理
+# ======================
+def stitch_charging_sessions(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
+    """充電セッションのギャップ補正と開始・終了フラグ作成"""
+    d = df.copy()
+
+    # 充電ギャップ補正
+    rows = []
+    for _, g in d.groupby("hashvin", sort=False):
+        g = g.copy()
+
+        # 短時間のFalseギャップを補正
+        charge_blocks = []
+        in_charge = False
+        start_idx = None
+
+        for i, (idx, row) in enumerate(g.iterrows()):
+            if row["is_charging"] and not in_charge:
+                # 充電開始
+                in_charge = True
+                start_idx = idx
+            elif not row["is_charging"] and in_charge:
+                # 充電が一時停止 - ギャップをチェック
+                if i + 1 < len(g):
+                    # 次の充電開始までの時間と距離をチェック
+                    next_charge_idx = None
+                    for j in range(i + 1, len(g)):
+                        if g.iloc[j]["is_charging"]:
+                            next_charge_idx = g.index[j]
+                            break
+
+                    if next_charge_idx is not None:
+                        time_gap = (
+                            g.loc[next_charge_idx, "tsu_current_time"]
+                            - row["tsu_current_time"]
+                        ).total_seconds() / 60.0
+                        dist_gap = calculate_geodesic_distance(
+                            row["tsu_rawgnss_latitude"],
+                            row["tsu_rawgnss_longitude"],
+                            g.loc[next_charge_idx, "tsu_rawgnss_latitude"],
+                            g.loc[next_charge_idx, "tsu_rawgnss_longitude"],
+                        )
+
+                        # ギャップが許容範囲内なら継続
+                        if (
+                            time_gap <= params.GAP_MAX_min
+                            and dist_gap <= params.DIST_TH_m
+                        ):
+                            continue
+
+                # 充電終了
+                charge_blocks.append((start_idx, idx))
+                in_charge = False
+                start_idx = None
+
+        # 最後まで充電中の場合
+        if in_charge and start_idx is not None:
+            charge_blocks.append((start_idx, g.index[-1]))
+
+        # 補正結果をマーキング
+        g["is_charging_stitched"] = False
+        g["charge_block_id"] = np.nan
+
+        for bid, (start_idx, end_idx) in enumerate(charge_blocks, 1):
+            # 範囲内のインデックスを取得して値を設定
+            mask = (g.index >= start_idx) & (g.index <= end_idx)
+            g.loc[mask, "is_charging_stitched"] = True
+            g.loc[mask, "charge_block_id"] = bid
+
+        rows.append(g)
+
+    result = (
+        pd.concat(rows)
+        .sort_values(["hashvin", "tsu_current_time"])
+        .reset_index(drop=True)
+    )
+
+    # 開始・終了フラグ作成
+    result["charge_start_flag"] = (
+        result.groupby("hashvin")["is_charging_stitched"]
+        .transform(lambda s: s & ~s.shift(1, fill_value=False))
+        .fillna(False)
+    )
+
+    result["charge_end_flag"] = (
+        result.groupby("hashvin")["is_charging_stitched"]
+        .transform(lambda s: ~s & s.shift(1, fill_value=False))
+        .fillna(False)
+    )
+
+    result["charge_session_id"] = result.groupby("hashvin")[
+        "charge_start_flag"
+    ].cumsum()
+
+    return result
+
+
+# ======================
+# セッション判定メイン処理
+# ======================
+
+# def determine_sessions(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
+#     """Step4-6: 各セッションの判定（優先度: parking→moving→idling）"""
+#     # paramsは将来の拡張用に保持
+#     _ = params  # 未使用警告を回避
+#     d = df.copy()
+
+#     # 初期化：すべてのセッションフラグをFalseに設定
+#     d["is_parking"] = False
+#     d["is_moving"] = False  
+#     d["is_idling"] = False
+
+#     # Step4: パーキングセッション判定（最優先）
+#     # igon_changeがTRUEの行の一つ前の行で、igon_changeがFALSEかつis_chargingがFALSEの場合
+#     # まず、igon_changeがTRUEの行を特定
+#     igon_change_true_mask = d["igon_change"] == True
+    
+#     # 次の行でigon_changeがTRUEになる行（一つ前の行）を特定
+#     next_igon_change_mask = d.groupby("hashvin")["igon_change"].shift(-1).fillna(False)
+    
+#     # パーキング条件：次の行でigon_changeがTRUE、かつ現在行でigon_changeがFALSE、かつis_chargingがFALSE
+#     d.loc[
+#         next_igon_change_mask & 
+#         (d["igon_change"] == False) & 
+#         (d["is_charging_stitched"] == False), 
+#         "is_parking"
+#     ] = True
+
+#     d["parking_start_flag"] = (
+#         d.groupby("hashvin")["is_parking"]
+#         .transform(lambda s: s & ~s.shift(1, fill_value=False))
+#         .fillna(False)
+#     )
+
+#     d["parking_end_flag"] = (
+#         d.groupby("hashvin")["is_parking"]
+#         .transform(lambda s: ~s & s.shift(1, fill_value=False))
+#         .fillna(False)
+#     )
+
+#     d["parking_session_id"] = d.groupby("hashvin")["parking_start_flag"].cumsum()
+
+#     # Step5: 移動中セッション判定（パーキング次点）
+#     # IG-ON、充電中でない、パーキング中でない、かつ移動距離がある場合
+#     d.loc[
+#         ~d["is_charging_stitched"] & 
+#         ~d["is_parking"] & 
+#         d["is_moving_distance"], 
+#         "is_moving"
+#     ] = True
+
+#     d["movement_start_flag"] = (
+#         d.groupby("hashvin")["is_moving"]
+#         .transform(lambda s: s & ~s.shift(1, fill_value=False))
+#         .fillna(False)
+#     )
+
+#     d["movement_end_flag"] = (
+#         d.groupby("hashvin")["is_moving"]
+#         .transform(lambda s: ~s & s.shift(1, fill_value=False))
+#         .fillna(False)
+#     )
+
+#     d["movement_session_id"] = d.groupby("hashvin")["movement_start_flag"].cumsum()
+
+#     # Step6: アイドリングセッション判定（最低優先度）
+#     # IG-ON、充電中でない、パーキング中でない、移動中でない場合
+#     d.loc[
+#         ~d["is_charging_stitched"] & 
+#         ~d["is_parking"] & 
+#         ~d["is_moving"], 
+#         "is_idling"
+#     ] = True
+
+#     d["idling_start_flag"] = (
+#         d.groupby("hashvin")["is_idling"]
+#         .transform(lambda s: s & ~s.shift(1, fill_value=False))
+#         .fillna(False)
+#     )
+
+#     d["idling_end_flag"] = (
+#         d.groupby("hashvin")["is_idling"]
+#         .transform(lambda s: ~s & s.shift(1, fill_value=False))
+#         .fillna(False)
+#     )
+
+#     d["idling_session_id"] = d.groupby("hashvin")["idling_start_flag"].cumsum()
+
+#     return d
+# ======================
+# セッション判定メイン処理（修正版）
+# ======================
+### is_pakingのstartとend 
+# - is_parkingのstartはis_parkingがFALSEからTRUEに変わったTRUEの行がstart
+#  →is_parkingがTRUEは、igonの前の行のこと。igonでエンジンが起動するので、その一つ前の行はエンジンOFF
+#  - is_parkingのendはis_parkingがTRUEからFALSEに変わったFALSEの行がend
+# 
+#  ### is_movementのstartとend
+#  - start条件
+#  - is_movementがFALSEからTRUEに変わるFALSEの行
+#  - end条件
+#  - is_movementがTRUEからFALSEに変わるTRUE行
+# 
+#  ### is_idlingのstartとend条件
+#  - start条件
+#  - is_idlingがFALSEからTRUEに変わるFALSE行
+#  - end条件
+#  - is_idlingがTRUEからFALSEに変わるTRUE行
+def determine_sessions(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
+    """Step4-6: 各セッションの判定
+       優先度: parking → moving → idling
+       ※開始・終了フラグの付与位置は要件どおり
+         - parking: start=True行, end=False行
+         - moving : start=False行, end=True行
+         - idling : start=False行, end=True行
+    """
+    _ = params  # 予備
+    d = df.copy()
+
+    # 初期化
+    d["is_parking"] = False
+    d["is_moving"]  = False
+    d["is_idling"]  = False
+
+    # -----------------------------
+    # Step4: パーキング判定（最優先）
+    # 「次の行で igon_change が True」かつ 現在行が「igon_change False & 非充電」
+    next_igon_change = (
+        d.groupby("hashvin")["igon_change"]
+        .shift(-1)
+        .fillna(False)
+        .astype(bool)
+    )
+    d.loc[
+        next_igon_change &
+        (~d["igon_change"].astype(bool)) &
+        (~d["is_charging_stitched"].astype(bool)),
+        "is_parking"
+    ] = True
+
+    # parking start/end（要件）
+    # start: False→True になった True 行
+    d["parking_start_flag"] = (
+        d.groupby("hashvin")["is_parking"]
+         .apply(lambda s: (s & ~s.shift(1, fill_value=False)))
+         .reset_index(level=0, drop=True)
+    )
+
+    # end: True→False になった False 行
+    d["parking_end_flag"] = (
+        d.groupby("hashvin")["is_parking"]
+         .apply(lambda s: (~s & s.shift(1, fill_value=False)))
+         .reset_index(level=0, drop=True)
+    )
+
+    # parking_session_id は True 側の開始で採番し、True 行のみに付与
+    parking_start_on_true = (
+        d.groupby("hashvin")["is_parking"]
+         .apply(lambda s: (s & ~s.shift(1, fill_value=False)))
+         .reset_index(level=0, drop=True)
+    )
+    d["parking_session_id"] = (
+        d.groupby("hashvin")[parking_start_on_true.name]
+         .apply(lambda s: parking_start_on_true.loc[s.index].cumsum())
+         .reset_index(level=0, drop=True)
+    )
+    # True 行のみIDを残し、その他は0（必要ならNaNでも可）
+    d.loc[~d["is_parking"], "parking_session_id"] = 0
+    d["parking_session_id"] = d["parking_session_id"].astype(int)
+
+    # -----------------------------
+    # Step5: 移動判定（パーキング以外で、移動距離がある等の条件）
+    # 既存ロジックを尊重：非充電 & 非パーキング & is_moving_distance
+    d.loc[
+        (~d["is_charging_stitched"].astype(bool)) &
+        (~d["is_parking"]) &
+        (d["is_moving_distance"].astype(bool)),
+        "is_moving"
+    ] = True
+
+    # moving start/end（要件）
+    # start: False→True になる直前の False 行
+    d["movement_start_flag"] = (
+        d.groupby("hashvin")["is_moving"]
+         .apply(lambda s: ((~s) & s.shift(-1, fill_value=False)))
+         .reset_index(level=0, drop=True)
+    )
+    # end: True→False になる True 行
+    d["movement_end_flag"] = (
+        d.groupby("hashvin")["is_moving"]
+         .apply(lambda s: (s & ~s.shift(-1, fill_value=False)))
+         .reset_index(level=0, drop=True)
+    )
+
+    # movement_session_id は True 側の開始で採番し、True 行のみに付与
+    movement_start_on_true = (
+        d.groupby("hashvin")["is_moving"]
+         .apply(lambda s: (s & ~s.shift(1, fill_value=False)))
+         .reset_index(level=0, drop=True)
+    )
+    d["movement_session_id"] = (
+        d.groupby("hashvin")[movement_start_on_true.name]
+         .apply(lambda s: movement_start_on_true.loc[s.index].cumsum())
+         .reset_index(level=0, drop=True)
+    )
+    d.loc[~d["is_moving"], "movement_session_id"] = 0
+    d["movement_session_id"] = d["movement_session_id"].astype(int)
+
+    # -----------------------------
+    # Step6: アイドリング判定（残り：非充電 & 非パーキング & 非移動）
+    d.loc[
+        (~d["is_charging_stitched"].astype(bool)) &
+        (~d["is_parking"]) &
+        (~d["is_moving"]),
+        "is_idling"
+    ] = True
+
+    # idling start/end（要件）
+    # start: False→True になる直前の False 行
+    d["idling_start_flag"] = (
+        d.groupby("hashvin")["is_idling"]
+         .apply(lambda s: ((~s) & s.shift(-1, fill_value=False)))
+         .reset_index(level=0, drop=True)
+    )
+    # end: True→False になる True 行
+    d["idling_end_flag"] = (
+        d.groupby("hashvin")["is_idling"]
+         .apply(lambda s: (s & ~s.shift(-1, fill_value=False)))
+         .reset_index(level=0, drop=True)
+    )
+
+    # idling_session_id は True 側の開始で採番し、True 行のみに付与
+    idling_start_on_true = (
+        d.groupby("hashvin")["is_idling"]
+         .apply(lambda s: (s & ~s.shift(1, fill_value=False)))
+         .reset_index(level=0, drop=True)
+    )
+    d["idling_session_id"] = (
+        d.groupby("hashvin")[idling_start_on_true.name]
+         .apply(lambda s: idling_start_on_true.loc[s.index].cumsum())
+         .reset_index(level=0, drop=True)
+    )
+    d.loc[~d["is_idling"], "idling_session_id"] = 0
+    d["idling_session_id"] = d["idling_session_id"].astype(int)
+
+    return d
+
+
+
+# ======================
+# 充電後移動なし判定
+# ======================
+def check_no_movement_after_charge(
+    df: pd.DataFrame, params: SessionParams
+) -> pd.DataFrame:
+    """Step7: 充電後移動なし放置判定（改訂版）"""
+    d = df.copy()
+    d["is_no_move_after_charge"] = False
+
+    for _, g in d.groupby("hashvin", sort=False):
+        g = g.copy()
+        charge_start_indices = g[g["charge_start_flag"]].index
+
+        for cs_idx in charge_start_indices:
+            # 充電開始後の次の移動開始を探す
+            after_charge_start = g[g.index > cs_idx]
+            movement_start_mask = after_charge_start["movement_start_flag"]
+            
+            if movement_start_mask.any():
+                # 次の移動開始が見つかった場合
+                next_movement_idx = after_charge_start[movement_start_mask].index[0]
+                
+                # 充電開始から次の移動開始までのデータを取得
+                between_data = g[
+                    (g.index >= cs_idx) & (g.index < next_movement_idx)
+                ]
+                
+                # この期間の最大移動距離をチェック
+                if len(between_data) > 0:
+                    max_distance = between_data["distance_prev_m"].max()
+                    
+                    if max_distance <= params.DIST_TH_m:
+                        # 移動なしと判定 - この期間の放置セッション（inactive = idle + parking）をマーク
+                        inactive_data = between_data[between_data["is_idling"] | between_data["is_parking"]]
+                        if len(inactive_data) > 0:
+                            d.loc[inactive_data.index, "is_no_move_after_charge"] = True
+            else:
+                # 次の移動開始が見つからない場合、充電開始後の全データをチェック
+                after_charge_data = g[g.index > cs_idx]
+                
+                if len(after_charge_data) > 0:
+                    max_distance = after_charge_data["distance_prev_m"].max()
+                    
+                    if max_distance <= params.DIST_TH_m:
+                        # 移動なしと判定 - 充電開始後の放置セッションをマーク
+                        inactive_data = after_charge_data[after_charge_data["is_idling"] | after_charge_data["is_parking"]]
+                        if len(inactive_data) > 0:
+                            d.loc[inactive_data.index, "is_no_move_after_charge"] = True
+
+    return d
+
+
+# ======================
+# 放置時間分類
+# ======================
+def classify_parking_duration(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
+    """パーキングセッションの時間分類"""
+    d = df.copy()
+    d["parking_category"] = "unknown"
+    d["parking_duration_min"] = np.nan
+
+    for _, g in d.groupby("hashvin", sort=False):
+        g = g.copy()
+
+        # パーキングセッションごとに継続時間を計算
+        parking_sessions = g[g["parking_session_id"] > 0]["parking_session_id"].unique()
+
+        for session_id in parking_sessions:
+            session_data = g[g["parking_session_id"] == session_id]
+
+            if len(session_data) == 0:
+                continue
+
+            start_time = session_data["tsu_current_time"].iloc[0]
+            end_time = session_data["tsu_current_time"].iloc[-1]
+            duration_min = (end_time - start_time).total_seconds() / 60.0
+
+            # 分類
+            if duration_min < params.SHORT_PARK_min:
+                category = "短時間放置(<3h)"
+            elif duration_min < params.LONG_PARK_min:
+                category = "中時間放置(3-6h)"
+            else:
+                category = "長時間放置(≥6h)"
+
+            d.loc[session_data.index, "parking_duration_min"] = duration_min
+            d.loc[session_data.index, "parking_category"] = category
 
     return d
 
@@ -300,84 +717,260 @@ def preprocess_data(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
 # ======================
 # セッションタイプ統合処理
 # ======================
+# def determine_session_type(df: pd.DataFrame) -> pd.DataFrame:
+#     """
+#     セッションフラグから統合session_type列を作成
+    
+#     【目的】
+#     個別のセッションフラグ（is_charging, is_moving等）を統合し、
+#     境界情報も保持しながら、分析しやすい単一の列を提供する。
+    
+#     【設計方針】
+#     1. 主要セッション優先: 境界があっても主セッションを明確化
+#     2. 境界情報分離: 複数イベント同時発生時の詳細情報を保持
+#     3. 優先順位: CHARGING > MOVING > IDLING > PARKING
+    
+#     【出力】
+#     - session_type: 主要セッションタイプ
+#     - is_inactive: 放置状態統合フラグ
+#     - inactive関連フラグ: 放置セッションの詳細情報
+#     """
+#     d = df.copy()
+
+
+#     # === 主要セッションタイプの決定 ===
+#     # 【方針】境界イベントがあっても、その行の主要な状態を明確にする
+#     # 【優先順位】CHARGING > MOVING > IDLING > PARKING
+#     #             （バッテリー劣化分析では充電状態が最重要）
+#     def get_primary_session_type(row):
+#         # 1. 充電優先（最重要）
+#         # 充電中はバッテリー状態が変化するため、他の状態より重要
+#         if row.get("is_charging_stitched", False):
+#             return SessionType.CHARGING.value
+
+#         # 2. 移動中
+#         # 実際に車両が移動している状態（エネルギー消費）
+#         if row.get("is_moving", False):
+#             return SessionType.MOVING.value
+
+#         # 3. アイドリング（放置の一種）
+#         # IG-ONだが移動していない状態（エネルギー消費あり）
+#         if row.get("is_idling", False):
+#             return SessionType.IDLING.value
+
+#         # 4. パーキング（放置の一種）
+#         # IG-OFFで駐車している状態（エネルギー消費最小）
+#         if row.get("is_parking", False):
+#             return SessionType.PARKING.value
+
+#         # デフォルト: 該当するセッションなし（データ不備等）
+#         return None
+
+#     # 主要セッションタイプを全行に適用
+#     d["session_type"] = d.apply(get_primary_session_type, axis=1)
+
+#     # === 放置状態（inactive）の統合処理 ===
+#     # 【目的】idling + parking = inactive として、放置状態を統一的に扱う
+#     # 【理由】バッテリー劣化分析では、IG-ON/OFFの違いより放置時間が重要
+#     d["is_inactive"] = d["is_idling"] | d["is_parking"]
+    
+#     # inactive開始フラグ: 放置状態になった瞬間を検出
+#     # 【ロジック】現在が放置中 かつ 前行が放置でない場合
+#     d["inactive_start_flag"] = (
+#         d.groupby("hashvin")["is_inactive"]
+#         .transform(lambda s: s & ~s.shift(1, fill_value=False))
+#         .fillna(False)
+#     )
+    
+#     # inactive終了フラグ: 放置状態から抜けた瞬間を検出
+#     # 【ロジック】現在が放置でない かつ 前行が放置中の場合
+#     d["inactive_end_flag"] = (
+#         d.groupby("hashvin")["is_inactive"]
+#         .transform(lambda s: ~s & s.shift(1, fill_value=False))
+#         .fillna(False)
+#     )
+    
+#     # inactiveセッションID: 各放置セッションに一意のIDを付与
+#     # 【用途】放置期間の集計や分析時のグループ化に使用
+#     d["inactive_session_id"] = d.groupby("hashvin")["inactive_start_flag"].cumsum()
+
+#     return d
+
+import numpy as np
+import pandas as pd
+
 def determine_session_type(df: pd.DataFrame) -> pd.DataFrame:
     """
-    セッションフラグから統合session_type列を作成
-    
-    【目的】
-    個別のセッションフラグ（is_charging, is_moving等）を統合し、
-    境界情報も保持しながら、分析しやすい単一の列を提供する。
-    
-    【設計方針】
-    1. 主要セッション優先: 境界があっても主セッションを明確化
-    2. 境界情報分離: 複数イベント同時発生時の詳細情報を保持
-    3. 優先順位: CHARGING > MOVING > IDLING > PARKING
-    
-    【出力】
-    - session_type: 主要セッションタイプ
-    - is_inactive: 放置状態統合フラグ
-    - inactive関連フラグ: 放置セッションの詳細情報
+    セッションフラグから統合 session_type と、inactive（= idling ∪ parking）の
+    開始・終了フラグ/セッションIDを“ブロック駆動”で生成する。
+
+    重要ポイント（ズレない理由）:
+      1) まず is_inactive = is_idling | is_parking から「連続ブロック」を抽出
+         - ブロック開始 = is_inactive が False→True になる最初の True 行（canonical start）
+         - ブロック終了 = is_inactive が True→False になる最初の False 行（canonical end）
+         - ブロック内の idling↔parking 切替は「モード切替」であり、inactive の境界ではない
+      2) 各ブロックごとに、仕様どおりの“アンカー行”に start/end を1つずつ立てる
+         - start アンカー:
+             * ブロック開始行で parking==True なら、その True 行（parking の仕様）
+             * そうでなく idling==True なら、その直前の False 行（idling の仕様）
+             * 先頭行で前行が無い等の端ケースは、当該開始 True 行に立てる（安全フォールバック）
+         - end アンカー:
+             * ブロック終了直前（最後の True 行）が parking==True なら、終了は False 行（parking の仕様）
+             * そうでなく idling==True なら、終了は最後の True 行（idling の仕様）
+             * データ終端まで継続し終了が無い場合は end を立てない（未終了ブロック）
+
+    これにより、
+      - OR で起こる「区間内に start/end が複数発生」問題を根本から回避
+      - 事後の“同時発生潰し”も不要（論理的に1ブロック=1 start + 1 end）
+
+    前提:
+      - hashvin 内で時系列順に並んでいること（本関数では並び替えは行わない）
+
+    出力:
+      - session_type: "charging"|"moving"|"idling"|"parking"|None（優先度 CHARGING > MOVING > IDLING > PARKING）
+      - is_inactive: bool（idling or parking）
+      - inactive_start_flag, inactive_end_flag: アンカー行にのみ True
+      - inactive_session_id: 連続ブロックID（is_inactive==True 行にのみ >0）
+      - inactive_start_source / inactive_end_source: どちらの仕様に基づくアンカーか
+      - boundary_events / has_boundary: デバッグ用のイベント要約
     """
+
     d = df.copy()
 
+    # --- 防御的初期化（欠けていても落ちない） ---
+    if "hashvin" not in d.columns:
+        d["hashvin"] = "__all__"
 
-    # === 主要セッションタイプの決定 ===
-    # 【方針】境界イベントがあっても、その行の主要な状態を明確にする
-    # 【優先順位】CHARGING > MOVING > IDLING > PARKING
-    #             （バッテリー劣化分析では充電状態が最重要）
-    def get_primary_session_type(row):
-        # 1. 充電優先（最重要）
-        # 充電中はバッテリー状態が変化するため、他の状態より重要
-        if row.get("is_charging_stitched", False):
-            return SessionType.CHARGING.value
+    for col in ["is_charging_stitched", "is_moving", "is_idling", "is_parking"]:
+        if col not in d.columns:
+            d[col] = False
+        d[col] = d[col].fillna(False).astype(bool)
 
-        # 2. 移動中
-        # 実際に車両が移動している状態（エネルギー消費）
-        if row.get("is_moving", False):
-            return SessionType.MOVING.value
+    # --- session_type（優先度: charging > moving > idling > parking） ---
+    def _val(name: str) -> str:
+        try:
+            return getattr(SessionType, name.upper()).value  # noqa: F821
+        except Exception:
+            return name.lower()
 
-        # 3. アイドリング（放置の一種）
-        # IG-ONだが移動していない状態（エネルギー消費あり）
-        if row.get("is_idling", False):
-            return SessionType.IDLING.value
+    d["session_type"] = None
+    # charging
+    mask = d["is_charging_stitched"]
+    d.loc[mask, "session_type"] = _val("CHARGING")
+    # moving
+    d.loc[d["session_type"].isna() & d["is_moving"], "session_type"] = _val("MOVING")
+    # idling
+    d.loc[d["session_type"].isna() & d["is_idling"], "session_type"] = _val("IDLING")
+    # parking
+    d.loc[d["session_type"].isna() & d["is_parking"], "session_type"] = _val("PARKING")
 
-        # 4. パーキング（放置の一種）
-        # IG-OFFで駐車している状態（エネルギー消費最小）
-        if row.get("is_parking", False):
-            return SessionType.PARKING.value
-
-        # デフォルト: 該当するセッションなし（データ不備等）
-        return None
-
-    # 主要セッションタイプを全行に適用
-    d["session_type"] = d.apply(get_primary_session_type, axis=1)
-
-    # === 放置状態（inactive）の統合処理 ===
-    # 【目的】idling + parking = inactive として、放置状態を統一的に扱う
-    # 【理由】バッテリー劣化分析では、IG-ON/OFFの違いより放置時間が重要
+    # --- inactive 基本フラグ ---
     d["is_inactive"] = d["is_idling"] | d["is_parking"]
-    
-    # inactive開始フラグ: 放置状態になった瞬間を検出
-    # 【ロジック】現在が放置中 かつ 前行が放置でない場合
-    d["inactive_start_flag"] = (
-        d.groupby("hashvin")["is_inactive"]
-        .transform(lambda s: s & ~s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-    
-    # inactive終了フラグ: 放置状態から抜けた瞬間を検出
-    # 【ロジック】現在が放置でない かつ 前行が放置中の場合
-    d["inactive_end_flag"] = (
-        d.groupby("hashvin")["is_inactive"]
-        .transform(lambda s: ~s & s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-    
-    # inactiveセッションID: 各放置セッションに一意のIDを付与
-    # 【用途】放置期間の集計や分析時のグループ化に使用
-    d["inactive_session_id"] = d.groupby("hashvin")["inactive_start_flag"].cumsum()
+
+    # 出力列の器
+    d["inactive_start_flag"] = False
+    d["inactive_end_flag"]   = False
+    d["inactive_start_source"] = None  # "idling(False_row)" | "parking(True_row)"
+    d["inactive_end_source"]   = None  # "idling(True_row)"  | "parking(False_row)"
+    d["inactive_session_id"] = 0
+
+    # === ブロック駆動: hashvin ごとに処理 ===
+    for vin, sub in d.groupby("hashvin", sort=False):
+        idx = sub.index.to_numpy()
+        idl = sub["is_idling"].to_numpy(dtype=bool)
+        prk = sub["is_parking"].to_numpy(dtype=bool)
+        ina = (idl | prk).astype(bool)
+
+        if idx.size == 0:
+            continue
+
+        # 連続ブロックの canonical start/end（is_inactive の遷移のみで決定）
+        prev_ina = np.r_[False, ina[:-1]]
+        next_ina = np.r_[ina[1:], False]
+        starts_true = np.where(ina & ~prev_ina)[0]   # ブロックの最初の True 行
+        ends_false  = np.where(~ina & prev_ina)[0]   # ブロックの直後の False 行
+
+        # セッションIDは「ブロック開始(True行)」の累積で付与し、True 行にのみ残す
+        # ここはアンカー位置（前の False 行）とは切り離し、IDの安定性を担保
+        block_start_true_flag = np.zeros_like(ina, dtype=bool)
+        block_start_true_flag[starts_true] = True
+        session_id_series = block_start_true_flag.cumsum()
+        # is_inactive=False は 0 に
+        session_id_series = np.where(ina, session_id_series, 0)
+
+        # 結果を書き戻し（後でアンカーも立てる）
+        d.loc[idx, "inactive_session_id"] = session_id_series
+
+        # 各ブロックに 1 start + 1 end（未終了は end なし）
+        for s_pos in starts_true:
+            # --- start アンカー決定 ---
+            if prk[s_pos]:
+                # parking で始まっている → True 行が start アンカー
+                start_anchor_local = s_pos
+                start_source = "parking(True_row)"
+            elif idl[s_pos]:
+                # idling で始まっている → 直前の False 行が start アンカー
+                if s_pos > 0:
+                    start_anchor_local = s_pos - 1
+                    start_source = "idling(False_row)"
+                else:
+                    # 先頭行で直前が無い場合のフォールバック（True 行に立てる）
+                    start_anchor_local = s_pos
+                    start_source = "idling(False_row|fallback_to_first_true)"
+            else:
+                # 理論上ここには来ないが、防御
+                start_anchor_local = s_pos
+                start_source = "unknown(start_on_true)"
+
+            start_anchor_idx = idx[start_anchor_local]
+            d.at[start_anchor_idx, "inactive_start_flag"] = True
+            d.at[start_anchor_idx, "inactive_start_source"] = start_source
+
+            # --- end アンカー決定 ---
+            # この start 以降で最初に現れるブロック終了 False 行を取得
+            e_candidates = ends_false[ends_false > s_pos]
+            if e_candidates.size == 0:
+                # 未終了（データ終端まで放置継続）の場合、end は立てない
+                continue
+
+            e_pos = int(e_candidates[0])            # ブロック直後の False 行（canonical end）
+            last_true = e_pos - 1                   # 直前の True 行（ブロックの最終 True 行）
+            if last_true < 0:
+                # 防御（理論上あり得ない）
+                last_true = 0
+
+            if prk[last_true]:
+                # parking で終わっている → False 行が end アンカー
+                end_anchor_local = e_pos
+                end_source = "parking(False_row)"
+            elif idl[last_true]:
+                # idling で終わっている → 直前の True 行が end アンカー
+                end_anchor_local = last_true
+                end_source = "idling(True_row)"
+            else:
+                # 防御（理論上あり得ない）
+                end_anchor_local = e_pos
+                end_source = "unknown(end_on_false)"
+
+            end_anchor_idx = idx[end_anchor_local]
+            d.at[end_anchor_idx, "inactive_end_flag"] = True
+            d.at[end_anchor_idx, "inactive_end_source"] = end_source
+
+    # --- 境界イベント（デバッグ用） ---
+    def _events_row(row) -> str:
+        ev = []
+        if row.get("inactive_start_flag", False): ev.append("inactive_start")
+        if row.get("inactive_end_flag", False):   ev.append("inactive_end")
+        return "|".join(ev)
+
+    d["boundary_events"] = d.apply(_events_row, axis=1)
+    d["has_boundary"] = d["boundary_events"].astype(str).str.len().gt(0)
+
+    # 型整備
+    d["inactive_session_id"] = d["inactive_session_id"].astype(int)
 
     return d
+
 
 
 # ======================
@@ -412,7 +1005,7 @@ def extract_charge_to_inactive_sessions(
         # 充電開始点を特定
         charge_starts = vehicle_data[vehicle_data["charge_start_flag"]].index.tolist()
 
-        for charge_start_idx in charge_starts:
+        for i, charge_start_idx in enumerate(charge_starts):
             session_info = {
                 "hashvin": hashvin,
                 "charge_to_inactive_session_id": len(result_sessions) + 1,
@@ -543,678 +1136,169 @@ def extract_charge_to_inactive_sessions(
     return pd.DataFrame(result_sessions)
 
 
-# ======================
-# 充電セッション処理
-# ======================
-def stitch_charging_sessions(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
-    """充電セッションのギャップ補正と開始・終了フラグ作成"""
-    d = df.copy()
+# from typing import Any, Dict, List, Optional
+# import pandas as pd
+
+# def extract_charge_to_inactive_sessions(
+#     df: pd.DataFrame, params
+# ) -> pd.DataFrame:
+#     """
+#     充電開始→充電終了→（移動あり）→最初の長時間放置→放置終了 を 1 区間として抽出。
+
+#     変更点:
+#       - 移動の有無は is_no_move_after_charge で判定（True が1つでもあれば除外）
+#       - 次の充電開始が存在しない場合は、その hashvin の最終行を探索終端に採用
+#     使う主な列:
+#       hashvin, tsu_current_time, charge_start_flag, charge_end_flag,
+#       inactive_start_flag, inactive_end_flag, inactive_session_id,
+#       is_inactive, is_no_move_after_charge
+#     使う主なパラメータ:
+#       params.LONG_PARK_min : 長時間放置しきい値 [分]
+#     """
+#     results: List[Dict[str, Any]] = []
+
+#     for hashvin, vdf in df.groupby("hashvin"):
+#         vdf = vdf.sort_values("tsu_current_time").reset_index(drop=True)
+
+#         charge_starts: List[int] = vdf.index[vdf["charge_start_flag"]].tolist()
+
+#         for idx_cs, cs_idx in enumerate(charge_starts):
+#             # 充電終了
+#             ce_idxs = vdf.index[(vdf.index > cs_idx) & (vdf["charge_end_flag"])]
+#             if len(ce_idxs) == 0:
+#                 results.append({
+#                     "hashvin": hashvin,
+#                     "charge_to_inactive_session_id": len(results) + 1,
+#                     "session_start_time": vdf.loc[cs_idx, "tsu_current_time"],
+#                     "is_valid_session": False,
+#                     "reason": "charge_end_not_found",
+#                 })
+#                 continue
+#             ce_idx = int(ce_idxs[0])
+
+#             # 次の充電開始があればその直前、なければこの hashvin の最終行
+#             if idx_cs + 1 < len(charge_starts):
+#                 window_end_idx = charge_starts[idx_cs + 1] - 1
+#             else:
+#                 window_end_idx = int(vdf.index.max())
+
+#             window_mask = (vdf.index > ce_idx) & (vdf.index <= window_end_idx)
+#             win = vdf.loc[window_mask].copy()
+
+#             rec: Dict[str, Any] = {
+#                 "hashvin": hashvin,
+#                 "charge_to_inactive_session_id": len(results) + 1,
+#                 "charge_start_idx": cs_idx,
+#                 "charge_start_time": vdf.loc[cs_idx, "tsu_current_time"],
+#                 "charge_end_idx": ce_idx,
+#                 "charge_end_time": vdf.loc[ce_idx, "tsu_current_time"],
+#             }
+
+#             # 放置候補（inactive_session_id 単位）
+#             candidates: List[Dict[str, Any]] = []
+#             if not win.empty and "inactive_session_id" in vdf.columns:
+#                 start_rows = win.loc[win["inactive_start_flag"] == True]  # noqa: E712
+#                 for sid in start_rows["inactive_session_id"].dropna().unique().tolist():
+#                     sid_rows = win.loc[win["inactive_session_id"] == sid]
+#                     if sid_rows.empty:
+#                         continue
+
+#                     inact_start_idx = int(sid_rows.index.min())
+
+#                     # 終了フラグが撮れていない未完了放置は採用不可
+#                     end_rows = sid_rows.loc[sid_rows["inactive_end_flag"] == True]  # noqa: E712
+#                     if len(end_rows) == 0:
+#                         continue
+#                     inact_end_idx = int(end_rows.index.max())
+
+#                     inact_start_time = vdf.loc[inact_start_idx, "tsu_current_time"]
+#                     inact_end_time   = vdf.loc[inact_end_idx, "tsu_current_time"]
+#                     inact_dur_min = (inact_end_time - inact_start_time).total_seconds() / 60.0
+
+#                     # 充電終了→この放置開始までの区間に "充電後移動なし" があるか
+#                     pre_inactive_slice = vdf.loc[(vdf.index >= ce_idx) & (vdf.index <= inact_start_idx)]
+#                     no_move_flag = bool(pre_inactive_slice.get("is_no_move_after_charge", pd.Series([False])).any())
+
+#                     candidates.append({
+#                         "inactive_session_id": sid,
+#                         "inactive_start_idx": inact_start_idx,
+#                         "inactive_end_idx": inact_end_idx,
+#                         "inactive_start_time": inact_start_time,
+#                         "inactive_end_time": inact_end_time,
+#                         "inactive_duration_min": inact_dur_min,
+#                         "is_no_move_after_charge": no_move_flag,
+#                     })
+
+#             # 条件: 「移動あり」= is_no_move_after_charge が False かつ 「長時間放置」
+#             chosen: Optional[Dict[str, Any]] = None
+#             for c in sorted(candidates, key=lambda x: x["inactive_start_idx"]):
+#                 if (not c["is_no_move_after_charge"]) and (c["inactive_duration_min"] >= params.LONG_PARK_min):
+#                     chosen = c
+#                     break
+
+#             # 採用なし → 理由を付けて無効レコード
+#             if chosen is None:
+#                 if len(candidates) == 0:
+#                     reason = "no_inactive_in_window"
+#                 else:
+#                     any_long = any(c["inactive_duration_min"] >= params.LONG_PARK_min for c in candidates)
+#                     any_move = any(not c["is_no_move_after_charge"] for c in candidates)
+#                     if (not any_move) and (not any_long):
+#                         reason = "no_movement_and_no_long_inactive"
+#                     elif not any_move:
+#                         reason = "no_movement_after_charge"
+#                     elif not any_long:
+#                         reason = "only_short_inactive"
+#                     else:
+#                         reason = "unknown_filter_out"
+
+#                 # 充電後移動なしの総合判定（ウィンドウ全体の参考値）
+#                 overall_no_move = bool(win.get("is_no_move_after_charge", pd.Series([False])).any())
+
+#                 rec.update({
+#                     "inactive_session_id": None,
+#                     "inactive_start_idx": None,
+#                     "inactive_end_idx": None,
+#                     "session_end_time": None,
+#                     "charge_duration_min": (rec["charge_end_time"] - rec["charge_start_time"]).total_seconds() / 60.0,
+#                     "movement_duration_min": None,
+#                     "inactive_duration_min": None,
+#                     "total_session_duration_min": None,
+#                     "has_movement": (not overall_no_move),
+#                     "is_long_inactive": False,
+#                     "is_excluded_no_movement": overall_no_move,
+#                     "is_no_move_after_charge": overall_no_move,  # 参考出力
+#                     "is_valid_session": False,
+#                     "reason": reason,
+#                 })
+#                 results.append(rec)
+#                 continue
+
+#             # 採用セッションの集計
+#             session_end_time = chosen["inactive_end_time"]
+#             charge_dur_min = (rec["charge_end_time"] - rec["charge_start_time"]).total_seconds() / 60.0
+#             inactive_dur_min = chosen["inactive_duration_min"]
+#             total_dur_min = (session_end_time - rec["charge_start_time"]).total_seconds() / 60.0
+#             move_dur_min = max(0.0, total_dur_min - charge_dur_min - inactive_dur_min)
+
+#             rec.update({
+#                 "inactive_session_id": chosen["inactive_session_id"],
+#                 "inactive_start_idx": chosen["inactive_start_idx"],
+#                 "inactive_end_idx": chosen["inactive_end_idx"],
+#                 "inactive_start_time": chosen["inactive_start_time"],
+#                 "inactive_end_time": chosen["inactive_end_time"],
+#                 "session_end_time": session_end_time,
+#                 "charge_duration_min": charge_dur_min,
+#                 "movement_duration_min": move_dur_min,
+#                 "inactive_duration_min": inactive_dur_min,
+#                 "total_session_duration_min": total_dur_min,
+#                 "has_movement": True,  # is_no_move_after_charge を満たしていないことを条件に採用
+#                 "is_long_inactive": True,
+#                 "is_excluded_no_movement": False,
+#                 "is_no_move_after_charge": False,  # 採用条件により False 固定
+#                 "is_valid_session": True,
+#             })
+#             results.append(rec)
+
+#     return pd.DataFrame(results)
 
-    # 充電ギャップ補正
-    rows = []
-    for _, g in d.groupby("hashvin", sort=False):
-        g = g.copy()
-
-        # 短時間のFalseギャップを補正
-        charge_blocks = []
-        in_charge = False
-        start_idx = None
-
-        for i, (idx, row) in enumerate(g.iterrows()):
-            if row["is_charging"] and not in_charge:
-                # 充電開始
-                in_charge = True
-                start_idx = idx
-            elif not row["is_charging"] and in_charge:
-                # 充電が一時停止 - ギャップをチェック
-                if i + 1 < len(g):
-                    # 次の充電開始までの時間と距離をチェック
-                    next_charge_idx = None
-                    for j in range(i + 1, len(g)):
-                        if g.iloc[j]["is_charging"]:
-                            next_charge_idx = g.index[j]
-                            break
-
-                    if next_charge_idx is not None:
-                        time_gap = (
-                            g.loc[next_charge_idx, "tsu_current_time"]
-                            - row["tsu_current_time"]
-                        ).total_seconds() / 60.0
-                        dist_gap = calculate_geodesic_distance(
-                            row["tsu_rawgnss_latitude"],
-                            row["tsu_rawgnss_longitude"],
-                            g.loc[next_charge_idx, "tsu_rawgnss_latitude"],
-                            g.loc[next_charge_idx, "tsu_rawgnss_longitude"],
-                        )
-
-                        # ギャップが許容範囲内なら継続
-                        if (
-                            time_gap <= params.GAP_MAX_min
-                            and dist_gap <= params.DIST_TH_m
-                        ):
-                            continue
-
-                # 充電終了
-                charge_blocks.append((start_idx, idx))
-                in_charge = False
-                start_idx = None
-
-        # 最後まで充電中の場合
-        if in_charge and start_idx is not None:
-            charge_blocks.append((start_idx, g.index[-1]))
-
-        # 補正結果をマーキング
-        g["is_charging_stitched"] = False
-        g["charge_block_id"] = np.nan
-
-        for bid, (start_idx, end_idx) in enumerate(charge_blocks, 1):
-            # 範囲内のインデックスを取得して値を設定
-            mask = (g.index >= start_idx) & (g.index <= end_idx)
-            g.loc[mask, "is_charging_stitched"] = True
-            g.loc[mask, "charge_block_id"] = bid
-
-        rows.append(g)
-
-    result = (
-        pd.concat(rows)
-        .sort_values(["hashvin", "tsu_current_time"])
-        .reset_index(drop=True)
-    )
-
-    # 開始・終了フラグ作成
-    result["charge_start_flag"] = (
-        result.groupby("hashvin")["is_charging_stitched"]
-        .transform(lambda s: s & ~s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-
-    result["charge_end_flag"] = (
-        result.groupby("hashvin")["is_charging_stitched"]
-        .transform(lambda s: ~s & s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-
-    result["charge_session_id"] = result.groupby("hashvin")[
-        "charge_start_flag"
-    ].cumsum()
-
-    return result
-
-
-# ======================
-# セッション判定メイン処理
-# ======================
-def determine_sessions(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
-    """Step4-6: 各セッションの判定（優先度: parking→moving→idling）"""
-    # paramsは将来の拡張用に保持
-    _ = params  # 未使用警告を回避
-    d = df.copy()
-
-    # 初期化：すべてのセッションフラグをFalseに設定
-    d["is_parking"] = False
-    d["is_moving"] = False  
-    d["is_idling"] = False
-
-    # Step4: パーキングセッション判定（最優先）
-    # IG-OFF状態かつ充電中でない場合にパーキング
-    d.loc[
-        (d["tsu_igon_time"].isna() | (d["tsu_igon_time"] == "")) & 
-        ~d["is_charging_stitched"], 
-        "is_parking"
-    ] = True
-
-    d["parking_start_flag"] = (
-        d.groupby("hashvin")["is_parking"]
-        .transform(lambda s: s & ~s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-
-    d["parking_end_flag"] = (
-        d.groupby("hashvin")["is_parking"]
-        .transform(lambda s: ~s & s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-
-    d["parking_session_id"] = d.groupby("hashvin")["parking_start_flag"].cumsum()
-
-    # Step5: 移動中セッション判定（パーキング次点）
-    # IG-ON、充電中でない、パーキング中でない、かつ移動距離がある場合
-    d.loc[
-        (d["tsu_igon_time"].notna() & (d["tsu_igon_time"] != "")) &
-        ~d["is_charging_stitched"] & 
-        ~d["is_parking"] & 
-        d["is_moving_distance"], 
-        "is_moving"
-    ] = True
-
-    d["movement_start_flag"] = (
-        d.groupby("hashvin")["is_moving"]
-        .transform(lambda s: s & ~s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-
-    d["movement_end_flag"] = (
-        d.groupby("hashvin")["is_moving"]
-        .transform(lambda s: ~s & s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-
-    d["movement_session_id"] = d.groupby("hashvin")["movement_start_flag"].cumsum()
-
-    # Step6: アイドリングセッション判定（最低優先度）
-    # IG-ON、充電中でない、パーキング中でない、移動中でない場合
-    d.loc[
-        (d["tsu_igon_time"].notna() & (d["tsu_igon_time"] != "")) &
-        ~d["is_charging_stitched"] & 
-        ~d["is_parking"] & 
-        ~d["is_moving"], 
-        "is_idling"
-    ] = True
-
-    d["idling_start_flag"] = (
-        d.groupby("hashvin")["is_idling"]
-        .transform(lambda s: s & ~s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-
-    d["idling_end_flag"] = (
-        d.groupby("hashvin")["is_idling"]
-        .transform(lambda s: ~s & s.shift(1, fill_value=False))
-        .fillna(False)
-    )
-
-    d["idling_session_id"] = d.groupby("hashvin")["idling_start_flag"].cumsum()
-
-    return d
-
-
-# ======================
-# 充電後移動なし判定
-# ======================
-def check_no_movement_after_charge(
-    df: pd.DataFrame, params: SessionParams
-) -> pd.DataFrame:
-    """Step7: 充電後移動なし放置判定（改訂版）"""
-    d = df.copy()
-    d["is_no_move_after_charge"] = False
-
-    for _, g in d.groupby("hashvin", sort=False):
-        g = g.copy()
-        charge_start_indices = g[g["charge_start_flag"]].index
-
-        for cs_idx in charge_start_indices:
-            # 充電開始後の次の移動開始を探す
-            after_charge_start = g[g.index > cs_idx]
-            movement_start_mask = after_charge_start["movement_start_flag"]
-            
-            if movement_start_mask.any():
-                # 次の移動開始が見つかった場合
-                next_movement_idx = after_charge_start[movement_start_mask].index[0]
-                
-                # 充電開始から次の移動開始までのデータを取得
-                between_data = g[
-                    (g.index >= cs_idx) & (g.index < next_movement_idx)
-                ]
-                
-                # この期間の最大移動距離をチェック
-                if len(between_data) > 0:
-                    max_distance = between_data["distance_prev_m"].max()
-                    
-                    if max_distance <= params.DIST_TH_m:
-                        # 移動なしと判定 - この期間の放置セッション（inactive = idle + parking）をマーク
-                        inactive_data = between_data[between_data["is_idling"] | between_data["is_parking"]]
-                        if len(inactive_data) > 0:
-                            d.loc[inactive_data.index, "is_no_move_after_charge"] = True
-            else:
-                # 次の移動開始が見つからない場合、充電開始後の全データをチェック
-                after_charge_data = g[g.index > cs_idx]
-                
-                if len(after_charge_data) > 0:
-                    max_distance = after_charge_data["distance_prev_m"].max()
-                    
-                    if max_distance <= params.DIST_TH_m:
-                        # 移動なしと判定 - 充電開始後の放置セッションをマーク
-                        inactive_data = after_charge_data[after_charge_data["is_idling"] | after_charge_data["is_parking"]]
-                        if len(inactive_data) > 0:
-                            d.loc[inactive_data.index, "is_no_move_after_charge"] = True
-
-    return d
-
-
-# ======================
-# 放置時間分類
-# ======================
-def classify_parking_duration(df: pd.DataFrame, params: SessionParams) -> pd.DataFrame:
-    """パーキングセッションの時間分類"""
-    d = df.copy()
-    d["parking_category"] = "unknown"
-    d["parking_duration_min"] = np.nan
-
-    for _, g in d.groupby("hashvin", sort=False):
-        g = g.copy()
-
-        # パーキングセッションごとに継続時間を計算
-        parking_sessions = g[g["parking_session_id"] > 0]["parking_session_id"].unique()
-
-        for session_id in parking_sessions:
-            session_data = g[g["parking_session_id"] == session_id]
-
-            if len(session_data) == 0:
-                continue
-
-            start_time = session_data["tsu_current_time"].iloc[0]
-            end_time = session_data["tsu_current_time"].iloc[-1]
-            duration_min = (end_time - start_time).total_seconds() / 60.0
-
-            # 分類
-            if duration_min < params.SHORT_PARK_min:
-                category = "短時間放置(<3h)"
-            elif duration_min < params.LONG_PARK_min:
-                category = "中時間放置(3-6h)"
-            else:
-                category = "長時間放置(≥6h)"
-
-            d.loc[session_data.index, "parking_duration_min"] = duration_min
-            d.loc[session_data.index, "parking_category"] = category
-
-    return d
-
-
-# ======================
-# メイン処理関数
-# ======================
-def detect_sessions(
-    df: pd.DataFrame, params: Optional[SessionParams] = None
-) -> pd.DataFrame:
-    """
-    5つのセッションを判定するメイン関数
-
-    入力:
-        df: 時系列データ (hashvin, tsu_current_time, tsu_igon_time,
-                        tsu_rawgnss_latitude, tsu_rawgnss_longitude, soc, charge_mode)
-        params: セッション判定パラメータ
-
-    出力:
-        セッションフラグが付与されたDataFrame
-    """
-    p = params or SessionParams()
-
-    # Step1-3: 前処理
-    print("Step1-3: 基礎データ準備中...")
-    d1 = preprocess_data(df, p)
-
-    # 充電セッション処理
-    print("充電セッション処理中...")
-    d2 = stitch_charging_sessions(d1, p)
-
-    # Step4-6: セッション判定
-    print("Step4-6: セッション判定中...")
-    d3 = determine_sessions(d2, p)
-
-    # Step7: 充電後移動なし判定
-    print("Step7: 充電後移動なし判定中...")
-    d4 = check_no_movement_after_charge(d3, p)
-
-    # 放置時間分類
-    print("放置時間分類中...")
-    d5 = classify_parking_duration(d4, p)
-
-    # セッションタイプ統合
-    print("セッションタイプ統合中...")
-    d6 = determine_session_type(d5)
-
-    print("セッション判定完了!")
-    return d6
-
-
-# ======================
-# 品質チェック関数
-# ======================
-def validate_sessions(df: pd.DataFrame) -> Dict[str, Any]:
-    """セッション判定結果の品質チェック"""
-    results: Dict[str, Any] = {
-        "total_rows": len(df),
-        "session_coverage": {},
-        "session_overlaps": {},
-        "charge_coverage": 0.0,
-        "errors": [],
-    }
-
-    # セッションカバレッジチェック
-    session_flags = ["is_charging_stitched", "is_moving", "is_idling", "is_parking", "is_inactive"]
-    for flag in session_flags:
-        if flag in df.columns:
-            results["session_coverage"][flag] = int(df[flag].sum())
-        else:
-            results["errors"].append(f"列が見つかりません: {flag}")
-
-    # セッション重複チェック
-    for i, flag1 in enumerate(session_flags):
-        if flag1 not in df.columns:
-            continue
-        for flag2 in session_flags[i + 1 :]:
-            if flag2 not in df.columns:
-                continue
-            overlap = int((df[flag1] & df[flag2]).sum())
-            if overlap > 0:
-                results["session_overlaps"][f"{flag1}_vs_{flag2}"] = overlap
-                results["errors"].append(
-                    f"セッション重複: {flag1} vs {flag2} = {overlap}行"
-                )
-
-    # 充電イベント捕捉率
-    if "charge_mode" in df.columns and "is_charging_stitched" in df.columns:
-        charge_mode_count = int(
-            df["charge_mode"]
-            .isin(["100V charging", "200V charging", "Fast charging"])
-            .sum()
-        )
-        charge_stitched_count = int(df["is_charging_stitched"].sum())
-        if charge_mode_count > 0:
-            results["charge_coverage"] = float(charge_stitched_count) / float(
-                charge_mode_count
-            )
-
-    # 全時点カバレッジチェック
-    available_flags = [f for f in session_flags if f in df.columns]
-    if available_flags:
-        total_covered = int(df[available_flags].any(axis=1).sum())
-        results["total_coverage"] = float(total_covered) / float(len(df))
-
-        if results["total_coverage"] < 0.95:
-            results["errors"].append(
-                f"総カバレッジ不足: {results['total_coverage']:.2%}"
-            )
-
-    # session_type列のチェック
-    if "session_type" in df.columns:
-        session_type_counts = df["session_type"].value_counts()
-        results["session_type_distribution"] = session_type_counts.to_dict()
-
-        # 未分類（None）の行があるかチェック
-        none_count = df["session_type"].isna().sum()
-        if none_count > 0:
-            results["errors"].append(f"未分類のセッション: {none_count}行")
-
-    return results
-
-
-# ======================
-# セッション詳細データ抽出機能
-# ======================
-def extract_session_details(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    各セッションの開始・終了時点での詳細データを抽出
-    
-    Args:
-        df: セッション判定済みのDataFrame
-        
-    Returns:
-        セッション詳細データのDataFrame
-        - session_type: セッションタイプ
-        - session_id: セッションID
-        - event_type: 'start' または 'end'
-        - timestamp: 開始・終了時刻
-        - soc: SOC値
-        - distance_from_prev: 前の時点からの移動距離
-        - hashvin: 車両ID
-        - latitude, longitude: 位置情報
-        - duration_min: セッション時間（終了時点のみ）
-        - soc_diff: SOC差分（終了時点のみ）
-        - total_distance: セッション中の総移動距離（終了時点のみ）
-    """
-    result_data = []
-    
-    # セッションタイプとフラグの対応
-    session_configs = [
-        {
-            'type': 'charging',
-            'start_flag': 'charge_start_flag',
-            'end_flag': 'charge_end_flag',
-            'session_id': 'charge_session_id',
-            'active_flag': 'is_charging_stitched'
-        },
-        {
-            'type': 'moving',
-            'start_flag': 'movement_start_flag',
-            'end_flag': 'movement_end_flag',
-            'session_id': 'movement_session_id',
-            'active_flag': 'is_moving'
-        },
-        {
-            'type': 'idling',
-            'start_flag': 'idling_start_flag',
-            'end_flag': 'idling_end_flag',
-            'session_id': 'idling_session_id',
-            'active_flag': 'is_idling'
-        },
-        {
-            'type': 'parking',
-            'start_flag': 'parking_start_flag',
-            'end_flag': 'parking_end_flag',
-            'session_id': 'parking_session_id',
-            'active_flag': 'is_parking'
-        }
-    ]
-    
-    for hashvin, vehicle_data in df.groupby("hashvin"):
-        vehicle_data = vehicle_data.copy().sort_values("tsu_current_time")
-        
-        for config in session_configs:
-            session_type = config['type']
-            start_flag = config['start_flag']
-            end_flag = config['end_flag']
-            session_id_col = config['session_id']
-            active_flag = config['active_flag']
-            
-            # 必要なカラムが存在するかチェック
-            if not all(col in vehicle_data.columns for col in [start_flag, end_flag, session_id_col]):
-                continue
-                
-            # 開始イベントの処理
-            start_events = vehicle_data[vehicle_data[start_flag]].copy()
-            for _, row in start_events.iterrows():
-                result_data.append({
-                    'hashvin': hashvin,
-                    'session_type': session_type,
-                    'session_id': row[session_id_col],
-                    'event_type': 'start',
-                    'timestamp': row['tsu_current_time'],
-                    'soc': row['soc'],
-                    'distance_from_prev': row.get('distance_prev_m', 0),
-                    'latitude': row.get('tsu_rawgnss_latitude'),
-                    'longitude': row.get('tsu_rawgnss_longitude'),
-                    'duration_min': None,
-                    'soc_diff': None,
-                    'total_distance': None
-                })
-            
-            # 終了イベントの処理
-            end_events = vehicle_data[vehicle_data[end_flag]].copy()
-            for _, row in end_events.iterrows():
-                # 対応する開始イベントを探す
-                session_id = row[session_id_col]
-                session_data = vehicle_data[
-                    (vehicle_data[session_id_col] == session_id) & 
-                    (vehicle_data[active_flag])
-                ]
-                
-                # セッション期間の計算
-                if len(session_data) > 0:
-                    start_time = session_data['tsu_current_time'].min()
-                    end_time = row['tsu_current_time']
-                    duration_min = (end_time - start_time).total_seconds() / 60
-                    
-                    # SOC差分計算
-                    start_soc = session_data['soc'].iloc[0]
-                    end_soc = row['soc']
-                    soc_diff = end_soc - start_soc
-                    
-                    # 総移動距離計算
-                    total_distance = session_data['distance_prev_m'].sum()
-                else:
-                    duration_min = 0
-                    soc_diff = 0
-                    total_distance = 0
-                
-                result_data.append({
-                    'hashvin': hashvin,
-                    'session_type': session_type,
-                    'session_id': row[session_id_col],
-                    'event_type': 'end',
-                    'timestamp': row['tsu_current_time'],
-                    'soc': row['soc'],
-                    'distance_from_prev': row.get('distance_prev_m', 0),
-                    'latitude': row.get('tsu_rawgnss_latitude'),
-                    'longitude': row.get('tsu_rawgnss_longitude'),
-                    'duration_min': duration_min,
-                    'soc_diff': soc_diff,
-                    'total_distance': total_distance
-                })
-    
-    # 放置セッション（idling + parking統合）の処理
-    for hashvin, vehicle_data in df.groupby("hashvin"):
-        vehicle_data = vehicle_data.copy().sort_values("tsu_current_time")
-        
-        if 'inactive_start_flag' in vehicle_data.columns and 'inactive_end_flag' in vehicle_data.columns:
-            # 放置開始イベント
-            inactive_starts = vehicle_data[vehicle_data['inactive_start_flag']].copy()
-            for _, row in inactive_starts.iterrows():
-                # 放置の内訳を判定
-                breakdown = []
-                if row.get('is_idling', False):
-                    breakdown.append('idle')
-                if row.get('is_parking', False):
-                    breakdown.append('parking')
-                
-                result_data.append({
-                    'hashvin': hashvin,
-                    'session_type': 'inactive',
-                    'session_id': row.get('inactive_session_id', 0),
-                    'event_type': 'start',
-                    'timestamp': row['tsu_current_time'],
-                    'soc': row['soc'],
-                    'distance_from_prev': row.get('distance_prev_m', 0),
-                    'latitude': row.get('tsu_rawgnss_latitude'),
-                    'longitude': row.get('tsu_rawgnss_longitude'),
-                    'duration_min': None,
-                    'soc_diff': None,
-                    'total_distance': None,
-                    'inactive_breakdown': '|'.join(breakdown) if breakdown else 'unknown'
-                })
-            
-            # 放置終了イベント
-            inactive_ends = vehicle_data[vehicle_data['inactive_end_flag']].copy()
-            for _, row in inactive_ends.iterrows():
-                session_id = row.get('inactive_session_id', 0)
-                
-                # セッション期間データを取得
-                inactive_data = vehicle_data[
-                    (vehicle_data.get('inactive_session_id', 0) == session_id) & 
-                    (vehicle_data.get('is_inactive', False))
-                ]
-                
-                # 放置の内訳を判定
-                breakdown = []
-                if len(inactive_data) > 0:
-                    if inactive_data['is_idling'].any():
-                        breakdown.append('idle')
-                    if inactive_data['is_parking'].any():
-                        breakdown.append('parking')
-                
-                # セッション期間の計算
-                if len(inactive_data) > 0:
-                    start_time = inactive_data['tsu_current_time'].min()
-                    end_time = row['tsu_current_time']
-                    duration_min = (end_time - start_time).total_seconds() / 60
-                    
-                    start_soc = inactive_data['soc'].iloc[0]
-                    end_soc = row['soc']
-                    soc_diff = end_soc - start_soc
-                    
-                    total_distance = inactive_data['distance_prev_m'].sum()
-                else:
-                    duration_min = 0
-                    soc_diff = 0
-                    total_distance = 0
-                
-                result_data.append({
-                    'hashvin': hashvin,
-                    'session_type': 'inactive',
-                    'session_id': session_id,
-                    'event_type': 'end',
-                    'timestamp': row['tsu_current_time'],
-                    'soc': row['soc'],
-                    'distance_from_prev': row.get('distance_prev_m', 0),
-                    'latitude': row.get('tsu_rawgnss_latitude'),
-                    'longitude': row.get('tsu_rawgnss_longitude'),
-                    'duration_min': duration_min,
-                    'soc_diff': soc_diff,
-                    'total_distance': total_distance,
-                    'inactive_breakdown': '|'.join(breakdown) if breakdown else 'unknown'
-                })
-    
-    result_df = pd.DataFrame(result_data)
-    if len(result_df) > 0:
-        result_df = result_df.sort_values(['hashvin', 'timestamp']).reset_index(drop=True)
-    
-    return result_df
-
-
-def get_session_summary_by_type(df: pd.DataFrame, session_type: Optional[str] = None) -> pd.DataFrame:
-    """
-    特定のセッションタイプまたは全セッションのサマリーを取得
-    
-    Args:
-        df: セッション判定済みのDataFrame
-        session_type: 'charging', 'moving', 'idling', 'parking', 'inactive' または None（全て）
-        
-    Returns:
-        セッションサマリーのDataFrame
-    """
-    session_details = extract_session_details(df)
-    
-    if session_type:
-        session_details = session_details[session_details['session_type'] == session_type]
-    
-    if len(session_details) == 0:
-        return pd.DataFrame()
-    
-    # セッション単位でのサマリー作成
-    summary_data = []
-    
-    for (hashvin, s_type, s_id), group in session_details.groupby(['hashvin', 'session_type', 'session_id']):
-        start_row = group[group['event_type'] == 'start']
-        end_row = group[group['event_type'] == 'end']
-        
-        if len(start_row) > 0 and len(end_row) > 0:
-            start_data = start_row.iloc[0]
-            end_data = end_row.iloc[0]
-            
-            summary_data.append({
-                'hashvin': hashvin,
-                'session_type': s_type,
-                'session_id': s_id,
-                'start_timestamp': start_data['timestamp'],
-                'end_timestamp': end_data['timestamp'],
-                'start_soc': start_data['soc'],
-                'end_soc': end_data['soc'],
-                'soc_diff': end_data['soc_diff'],
-                'duration_min': end_data['duration_min'],
-                'total_distance': end_data['total_distance'],
-                'start_lat': start_data['latitude'],
-                'start_lon': start_data['longitude'],
-                'end_lat': end_data['latitude'],
-                'end_lon': end_data['longitude'],
-                'inactive_breakdown': end_data.get('inactive_breakdown')
-            })
-    
-    return pd.DataFrame(summary_data)
-
-
-if __name__ == "__main__":
-    print("5セッション判定モジュール")
-    print("使用方法:")
-    print("from session_detector import detect_sessions, SessionParams")
-    print("params = SessionParams()")
-    print("result = detect_sessions(df, params)")
