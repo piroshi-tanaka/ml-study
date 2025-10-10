@@ -1,4 +1,4 @@
-# temporal_network.py
+# day_temporal_network.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -6,107 +6,145 @@ import pandas as pd
 import numpy as np
 import networkx as nx
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Literal
+from typing import Optional, Tuple, List, Literal, Dict
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+
 # =========================================================
-# データモデル
+# モデル / ユーティリティ
 # =========================================================
 @dataclass
 class TemporalMeta:
     cluster_order: List[str]
     y_map: Dict[str, int]
     other_label: str
+    day_start_hour: int
 
-
-# =========================================================
-# ユーティリティ
-# =========================================================
 def _ensure_dt(df: pd.DataFrame, col: str) -> pd.Series:
     s = pd.to_datetime(df[col], errors="coerce")
     if s.isna().any():
-        bad = s.isna().sum()
-        raise ValueError(f"[{col}] に日時へ変換できない値が {bad} 件あります。")
+        raise ValueError(f"[{col}] に日時へ変換できない値が {int(s.isna().sum())} 件あります。")
     return s
 
-def _sin_cos_hour(ts: pd.Series) -> pd.DataFrame:
-    # 任意：時間帯を連続表現にしたいときに使える（今回は未使用）
-    hour = ts.dt.hour + ts.dt.minute/60.0
-    rad = 2*np.pi*hour/24.0
-    return pd.DataFrame({"hour_sin": np.sin(rad), "hour_cos": np.cos(rad)})
+def _service_day_floor(ts: pd.Series, day_start_hour: int) -> pd.Series:
+    """
+    例: day_start_hour=4 なら、毎日 04:00 をその日の開始とみなす。
+    04:00〜翌04:00を1サービス日とし、基準日付は「その日の04:00時点の日付」。
+    """
+    # tsをローカルタイムで扱っている前提（タイムゾーン扱いは外側で調整）
+    adj = ts - pd.to_timedelta(day_start_hour, unit="h")
+    return adj.dt.normalize()  # 00:00に丸め→それがサービス日の基準日付
+
+def _split_by_service_day(df: pd.DataFrame, start_col: str, end_col: str, day_start_hour: int) -> pd.DataFrame:
+    """
+    セッションをサービス日境界（毎日 day_start_hour）で分割。
+    長い滞在が 04:00 を跨ぐ場合、区切って2レコードにする。
+    """
+    d = df.copy()
+    d[start_col] = _ensure_dt(d, start_col)
+    d[end_col]   = _ensure_dt(d, end_col)
+    assert (d[end_col] >= d[start_col]).all(), "end_time < start_time の行があります。"
+
+    out = []
+    for _, r in d.iterrows():
+        s = r[start_col]
+        e = r[end_col]
+        # このイベントの最初のサービス日境界（次の day_start まで）
+        cur_start = s
+        while True:
+            # 現在のセグメントが属するサービス日の開始時刻
+            day0 = _service_day_floor(pd.Series([cur_start]), day_start_hour).iloc[0] + pd.Timedelta(hours=day_start_hour)
+            day1 = day0 + pd.Timedelta(days=1)  # 次のサービス日開始
+            seg_end = min(e, day1)  # 境界で分割
+            newr = r.copy()
+            newr[start_col] = cur_start
+            newr[end_col]   = seg_end
+            out.append(newr)
+            if seg_end >= e:
+                break
+            cur_start = seg_end
+    return pd.DataFrame(out).reset_index(drop=True)
+
+def _to_hours_since_day_start(ts: pd.Series, day_start_hour: int) -> pd.Series:
+    day0 = _service_day_floor(ts, day_start_hour) + pd.Timedelta(hours=day_start_hour)
+    return (ts - day0).dt.total_seconds() / 3600.0  # 0〜24 の範囲（最大で24に近い）
+
+
 
 # =========================================================
-# ノード/エッジ生成
+# ノード/エッジ生成（1日=固定24hビュー用）
 # =========================================================
-def build_temporal_network(
+def build_day_temporal_network(
     df: pd.DataFrame,
     *,
     time_col_start: str = "start_time",
-    time_col_end: str = "end_time",
-    cluster_col: str = "cluster_id",
-    type_col: str = "sessionType",              # "inactive" / "charging" / (movingは除外前提)
-    duration_col: str = "duration_minutes",
-    min_stop_minutes: int = 30,                 # 念のための下限フィルタ（0でオフ）
-    long_parking_hours: float = 6.0,            # 放置判定（inactive & >= 6h）
-    lane_offset_for_charging: float = 0.45,     # 充電をy方向にオフセット
-    top_n_clusters: Optional[int] = None,       # y軸は上位N + OTHER
+    time_col_end: str   = "end_time",
+    cluster_col: str    = "cluster_id",
+    type_col: str       = "sessionType",         # "inactive", "charging" （movingは前処理で除外済み）
+    duration_col: str   = "duration_minutes",
+    min_stop_minutes: int = 30,                  # 念のための下限（0で無効）
+    long_parking_hours: float = 6.0,             # inactive & >= 6h を放置扱い
+    day_start_hour: int = 4,                     # ⬅️ ここが肝：1日の開始を 4:00 に固定
+    top_n_clusters: Optional[int] = None,        # 上位N + OTHER
     other_label: str = "OTHER",
-    edge_stride: int = 1,                       # 遷移エッジ間引き
-    edge_anchor: Tuple[Literal["start","end"], Literal["start","end"]] = ("end", "start"),
-    jitter_std: float = 0.05
+    lane_offset_for_charging: float = 0.45,      # 充電を別レーンに
+    jitter_std: float = 0.03,
+    edge_anchor: Tuple[Literal["start","end"], Literal["start","end"]] = ("end","start")
 ) -> Tuple[pd.DataFrame, pd.DataFrame, TemporalMeta]:
     """
-    入力 df 必須列: [sessionType, start_time, end_time, cluster_id] + duration_minutes
-      - moving と 30分未満は既に除外済み想定だが、min_stop_minutes>0 なら再フィルタ
-    返り値:
-      nodes: 1行=イベント（滞在 or 充電）
-      edges: 連続イベント間の遷移（前の終了→次の開始等）
-      meta : y配置の順序など
+    - セッションを 4:00 境界で分割し、各セグメントに service_day を付与
+    - x=0..24h（4:00→0h 起点）の座標を付与（start_h, end_h, mid_h）
+    - 日内の連続イベント（同一 service_day）のみエッジで接続
     """
-    d = df.copy()
-    d[time_col_start] = _ensure_dt(d, time_col_start)
-    d[time_col_end]   = _ensure_dt(d, time_col_end)
+    need_cols = {type_col, time_col_start, time_col_end, cluster_col}
+    missing = need_cols - set(df.columns)
+    if missing:
+        raise KeyError(f"入力に必要な列が不足: {missing}")
 
+    d0 = df.copy()
     # duration
-    if duration_col in d.columns:
-        d["duration_min"] = pd.to_numeric(d[duration_col], errors="coerce")
-        if d["duration_min"].isna().any():
+    if duration_col in d0.columns:
+        d0["duration_min"] = pd.to_numeric(d0[duration_col], errors="coerce")
+        if d0["duration_min"].isna().any():
             raise ValueError(f"[{duration_col}] に数値変換できない値があります。")
     else:
-        d["duration_min"] = (d[time_col_end] - d[time_col_start]).dt.total_seconds()/60.0
-
-    d["duration_h"] = d["duration_min"]/60.0
+        d0[time_col_start] = _ensure_dt(d0, time_col_start)
+        d0[time_col_end]   = _ensure_dt(d0, time_col_end)
+        d0["duration_min"] = (d0[time_col_end] - d0[time_col_start]).dt.total_seconds()/60.0
 
     # 念のためのフィルタ
     if min_stop_minutes > 0:
-        d = d[d["duration_min"] >= min_stop_minutes].copy()
-    d = d[d[type_col] != "moving"].copy()
+        d0 = d0[d0["duration_min"] >= min_stop_minutes].copy()
+    d0 = d0[d0[type_col] != "moving"].copy()
 
-    # 時間属性
-    d["weekday"] = d[time_col_start].dt.weekday   # 0=Mon .. 6=Sun
-    d["month"]   = d[time_col_start].dt.month
-    d["t_mid"]   = d[time_col_start] + (d[time_col_end] - d[time_col_start])/2
+    # 日跨ぎ分割（4:00 境界）
+    d = _split_by_service_day(d0, time_col_start, time_col_end, day_start_hour)
+
+    # サービス日キー
+    d["service_day"] = _service_day_floor(d[time_col_start], day_start_hour)  # その日の 00:00（ただし 04:00起点前提の基準日付）
+    d["weekday"]     = (d["service_day"]).dt.weekday    # 0=Mon..6=Sun（サービス日に依存）
+    d["month"]       = (d["service_day"]).dt.month
+
+    # 0〜24h の時間座標
+    d["start_h"] = _to_hours_since_day_start(d[time_col_start], day_start_hour)
+    d["end_h"]   = _to_hours_since_day_start(d[time_col_end], day_start_hour)
+    d["mid_h"]   = (d["start_h"] + d["end_h"]) / 2.0
 
     # 放置フラグ
+    d["duration_h"] = d["duration_min"] / 60.0
     d["is_long_parking"] = (d[type_col].eq("inactive")) & (d["duration_h"] >= long_parking_hours)
 
-    # y軸順序（総滞在時間でソート）
+    # クラスタ順（総滞在分で並べ替え）
     clus_order = (
-        d.groupby(cluster_col)["duration_min"]
-         .sum()
-         .sort_values(ascending=False)
-         .index.tolist()
+        d.groupby(cluster_col)["duration_min"].sum().sort_values(ascending=False).index.tolist()
     )
     if top_n_clusters and len(clus_order) > top_n_clusters:
         keep = set(clus_order[:top_n_clusters])
         d[cluster_col] = np.where(d[cluster_col].isin(keep), d[cluster_col], other_label)
         clus_order = (
-            d.groupby(cluster_col)["duration_min"]
-             .sum()
-             .sort_values(ascending=False)
-             .index.tolist()
+            d.groupby(cluster_col)["duration_min"].sum().sort_values(ascending=False).index.tolist()
         )
 
     y_map = {cid: i for i, cid in enumerate(clus_order)}
@@ -115,209 +153,182 @@ def build_temporal_network(
     rng = np.random.default_rng(42)
     d["y_jitter"] = d["y"] + rng.normal(0, jitter_std, size=len(d))
 
-    # 並べ替え・ID
-    d = d.sort_values([time_col_start, time_col_end]).reset_index(drop=True)
+    # 並べ替え & node_id
+    d = d.sort_values(["service_day", time_col_start, time_col_end]).reset_index(drop=True)
     d["node_id"] = np.arange(len(d))
 
-    # エッジ作成
-    edges: List[Tuple[int,int]] = []
-    for i in range(1, len(d), edge_stride):
-        edges.append((int(d.loc[i-1, "node_id"]), int(d.loc[i, "node_id"])))
+    # 日内エッジの構築（同一 service_day 内で連続するイベントを接続）
+    edges = []
+    src_anchor, dst_anchor = edge_anchor
+    for _, g in d.groupby("service_day", sort=True):
+        g = g.sort_values(time_col_start)
+        ids = g["node_id"].tolist()
+        for p, c in zip(ids[:-1], ids[1:]):
+            edges.append((int(p), int(c)))
     e = pd.DataFrame(edges, columns=["src", "dst"])
 
-    # アンカー時刻（終了→開始など）
-    src_anchor, dst_anchor = edge_anchor
+    # アンカー（start/end）に応じた x 座標（0〜24h）
+    cols = ["node_id", "start_h", "end_h", "mid_h", "y_jitter", cluster_col, type_col,
+            "duration_min", "duration_h", "is_long_parking", "service_day", "weekday", "month"]
     e = (
-        e.merge(d[["node_id", time_col_start, time_col_end, "y_jitter", cluster_col, type_col]],
-                left_on="src", right_on="node_id", how="left")
+        e.merge(d[cols], left_on="src", right_on="node_id", how="left")
          .drop(columns=["node_id"])
-         .rename(columns={time_col_start:"src_start", time_col_end:"src_end",
+         .rename(columns={"start_h":"src_start_h","end_h":"src_end_h","mid_h":"src_mid_h",
                           "y_jitter":"y_src", cluster_col:"cluster_src", type_col:"type_src"})
     )
     e = (
-        e.merge(d[["node_id", time_col_start, time_col_end, "y_jitter", cluster_col, type_col]],
-                left_on="dst", right_on="node_id", how="left")
+        e.merge(d[cols], left_on="dst", right_on="node_id", how="left")
          .drop(columns=["node_id"])
-         .rename(columns={time_col_start:"dst_start", time_col_end:"dst_end",
+         .rename(columns={"start_h":"dst_start_h","end_h":"dst_end_h","mid_h":"dst_mid_h",
                           "y_jitter":"y_dst", cluster_col:"cluster_dst", type_col:"type_dst"})
     )
-    e["t_src"] = np.where(src_anchor == "start", e["src_start"], e["src_end"])
-    e["t_dst"] = np.where(dst_anchor == "start", e["dst_start"], e["dst_end"])
+    e["x_src"] = np.where(src_anchor == "start", e["src_start_h"], e["src_end_h"])
+    e["x_dst"] = np.where(dst_anchor == "start", e["dst_start_h"], e["dst_end_h"])
 
-    # nodes 出力
-    nodes = (
-        d[["node_id", time_col_start, time_col_end, "t_mid", "y_jitter",
-           cluster_col, type_col, "duration_min", "duration_h",
-           "is_long_parking", "weekday", "month"]]
-        .rename(columns={time_col_start:"start_time", time_col_end:"end_time",
-                         cluster_col:"cluster_id", type_col:"sessionType"})
-        .copy()
-    )
+    # 出力 nodes
+    nodes = d.rename(columns={cluster_col:"cluster_id", type_col:"sessionType"})[
+        ["node_id","service_day","weekday","month",
+         "start_h","end_h","mid_h","y_jitter",
+         "cluster_id","sessionType",
+         "duration_min","duration_h","is_long_parking"]
+    ].copy()
+
     edges = e.copy()
-    meta  = TemporalMeta(cluster_order=clus_order, y_map=y_map, other_label=other_label)
+    meta  = TemporalMeta(cluster_order=clus_order, y_map=y_map, other_label=other_label, day_start_hour=day_start_hour)
     return nodes, edges, meta
 
 
 # =========================================================
-# Plotly 可視化（共通：単一図）
+# 可視化（x=0..24h 固定）
 # =========================================================
-def plot_temporal_network(
+def plot_day_temporal_network(
     nodes: pd.DataFrame,
     edges: pd.DataFrame,
     *,
-    figsize: Tuple[int,int] = (1200, 450),
+    service_day: Optional[pd.Timestamp] = None,   # Noneなら全日合算（多すぎると重いので通常は日指定）
+    figsize: Tuple[int,int] = (1100, 420),
     show_duration_bar: bool = True,
-    bar_alpha_inactive: float = 0.35,
-    bar_alpha_charging: float = 0.3,
-    node_size_scale: float = 22.0,
+    bar_alpha_inactive: float = 0.4,
+    bar_alpha_charging: float = 0.35,
+    node_size_scale: float = 28.0,
     highlight_long_parking: bool = True,
-    ytick_compact: bool = True,
     title: Optional[str] = None
 ) -> go.Figure:
     """
-    x=時間, y=クラスタ（chargingはオフセット済み）
-    - 横棒: start→end（inactiveは太め）
-    - ノード: 点（chargingは三角 ^ で強調）
-    - エッジ: 微細な線（大量データ向けに省略）
+    指定日の 0..24h（4:00起点）を1枚に描く。service_dayは build関数が付与した基準日付（00:00）です。
     """
+    if service_day is not None:
+        nd = nodes[nodes["service_day"].eq(pd.to_datetime(service_day))]
+        ids = set(nd["node_id"])
+        ed = edges[edges["src"].isin(ids) & edges["dst"].isin(ids)]
+    else:
+        nd = nodes.copy()
+        ed = edges.copy()
+
     fig = go.Figure()
 
-    # 1) エッジ（軽くグレー）
-    if len(edges) > 0:
+    # 1) 遷移エッジ（薄い線）
+    if len(ed) > 0:
         fig.add_trace(go.Scattergl(
-            x=np.ravel(edges[["t_src","t_dst"]].values.T),
-            y=np.ravel(edges[["y_src","y_dst"]].values.T),
-            mode="lines",
-            line=dict(width=0.7),
-            opacity=0.15,
-            name="transition",
-            hoverinfo="skip",
-            showlegend=False
+            x=np.ravel(ed[["x_src","x_dst"]].values.T),
+            y=np.ravel(ed[["y_src","y_dst"]].values.T),
+            mode="lines", line=dict(width=0.8), opacity=0.18,
+            name="transition", hoverinfo="skip", showlegend=False
         ))
 
-    # 2) 滞在バー（start→end）
+    # 2) 横棒（start_h→end_h）：放置は太め、充電も可視化
     if show_duration_bar:
-        for sess, g in nodes.groupby("sessionType"):
-            if sess == "inactive":
-                width = 6
-                alpha = bar_alpha_inactive
-            elif sess == "charging":
-                width = 4
-                alpha = bar_alpha_charging
-            else:
-                width = 3
-                alpha = 0.25
-
+        for sess, g in nd.groupby("sessionType"):
+            width = 6 if sess=="inactive" else (4 if sess=="charging" else 3)
+            alpha = bar_alpha_inactive if sess=="inactive" else (bar_alpha_charging if sess=="charging" else 0.25)
             fig.add_trace(go.Scattergl(
-                x=np.ravel(g[["start_time","end_time"]].values.T),
+                x=np.ravel(g[["start_h","end_h"]].values.T),
                 y=np.ravel(g[["y_jitter","y_jitter"]].values.T),
-                mode="lines",
-                line=dict(width=width),
-                opacity=alpha,
-                name=f"{sess}_bar",
-                hoverinfo="skip",
-                showlegend=False
+                mode="lines", line=dict(width=width), opacity=alpha,
+                name=f"{sess}_bar", hoverinfo="skip", showlegend=False
             ))
 
-    # 3) ノード（点）
-    for sess, g in nodes.groupby("sessionType"):
-        sizes = np.clip(g["duration_h"] * node_size_scale, 12, 260)
-        marker = dict(size=sizes)
-        symbol = "circle"
-        if sess == "charging":
-            symbol = "triangle-up"
-            marker.update(line=dict(width=0.8))
-
+    # 3) ノード：充電は三角で少し大きく、放置は丸
+    for sess, g in nd.groupby("sessionType"):
+        sizes = np.clip(g["duration_h"] * node_size_scale, 12, 300)
+        symbol = "triangle-up" if sess=="charging" else "circle"
         fig.add_trace(go.Scattergl(
-            x=g["t_mid"],
-            y=g["y_jitter"],
-            mode="markers",
-            marker=marker,
-            name=f"{sess} (n={len(g)})",
+            x=g["mid_h"], y=g["y_jitter"], mode="markers",
+            marker=dict(size=sizes, symbol=symbol, line=dict(width=0.8 if sess=="charging" else 0)),
+            name=f"{sess} (n={len(g)})", opacity=0.85 if sess=="charging" else 0.7,
             customdata=np.stack([g["cluster_id"], g["duration_min"]], axis=1),
             hovertemplate=(
-                "time=%{x}<br>y=%{y:.2f}<br>cluster=%{customdata[0]}<br>"
+                "t=%{x:.2f}h<br>y=%{y:.2f}<br>cluster=%{customdata[0]}<br>"
                 "dur_min=%{customdata[1]:.0f}<extra>%{fullData.name}</extra>"
-            ),
-            marker_symbol=symbol,
-            opacity=0.75 if sess!="charging" else 0.9
+            )
         ))
 
     # 4) 長期放置の強調枠
-    if highlight_long_parking and "is_long_parking" in nodes.columns:
-        gp = nodes[nodes["is_long_parking"]]
-        if len(gp) > 0:
-            sizes = np.clip(gp["duration_h"] * node_size_scale, 28, 320)
+    if highlight_long_parking:
+        lp = nd[nd["is_long_parking"]]
+        if len(lp) > 0:
+            sizes = np.clip(lp["duration_h"] * node_size_scale, 28, 340)
             fig.add_trace(go.Scattergl(
-                x=gp["t_mid"], y=gp["y_jitter"],
-                mode="markers",
-                marker=dict(size=sizes, symbol="circle-open", line=dict(width=1.4)),
-                name="long_parking(>=6h)",
-                hoverinfo="skip",
-                opacity=0.95
+                x=lp["mid_h"], y=lp["y_jitter"], mode="markers",
+                marker=dict(size=sizes, symbol="circle-open", line=dict(width=1.5)),
+                name="long_parking(>=6h)", hoverinfo="skip", opacity=0.95
             ))
 
-    # 軸・レイアウト
     fig.update_layout(
-        title=title or "Temporal Network",
+        title=title or (f"Temporal Network (service_day={service_day.date()})" if service_day is not None else "Temporal Network — Day View"),
         width=figsize[0], height=figsize[1],
         plot_bgcolor="white",
-        legend=dict(orientation="h", x=1, xanchor="right", y=1.1),
-        margin=dict(l=60, r=20, t=60, b=40)
+        legend=dict(orientation="h", x=1, xanchor="right", y=1.08),
+        margin=dict(l=60, r=20, t=60, b=50)
     )
-    fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.08)")
-    fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.08)",
-                     title_text="cluster (lane offset for charging)")
-
-    # ytick を整数段に丸めてラベル（代表クラスタ名）
-    if ytick_compact:
-        y_round = nodes["y_jitter"].round()
-        ticks = np.sort(y_round.unique())
-        labels = []
-        tmp = nodes.copy()
-        tmp["y_round"] = y_round
-        for yv in ticks:
-            labels.append(tmp.loc[tmp["y_round"].eq(yv), "cluster_id"].value_counts().index[0])
-        fig.update_yaxes(tickmode="array", tickvals=ticks, ticktext=labels)
+    # x=0..24 固定
+    fig.update_xaxes(range=[0, 24], title="time of day (h from 04:00)", showgrid=True, gridcolor="rgba(0,0,0,0.08)")
+    # yはクラスタ段
+    # 簡易：四捨五入段ごとに代表クラスタ名
+    y_round = nd["y_jitter"].round()
+    ticks = np.sort(y_round.unique())
+    labels = []
+    tmp = nd.copy()
+    tmp["y_round"] = y_round
+    for yv in ticks:
+        labels.append(tmp.loc[tmp["y_round"].eq(yv), "cluster_id"].value_counts().index[0])
+    fig.update_yaxes(tickmode="array", tickvals=ticks, ticktext=labels, title="cluster (charging lane offset)")
 
     return fig
 
 
-# =========================================================
-# ファセット（曜日 / 月）— 同一描画関数を使い回し
-# =========================================================
-def facet_temporal_network(
+def facet_day_temporal_network(
     nodes: pd.DataFrame,
     edges: pd.DataFrame,
     *,
-    by: Literal["weekday","month"] = "weekday",
-    order: Optional[List[int]] = None,
+    service_days: Optional[List[pd.Timestamp]] = None,   # 指定しなければ全日（多いと重い）
     max_cols: int = 3,
     figsize_per: Tuple[int,int] = (900, 320),
-    title_prefix: str = ""
+    title: str = "Temporal Network — Daily Facets"
 ) -> go.Figure:
-    keys = sorted(nodes[by].unique().tolist()) if order is None else order
-    n = len(keys)
+    if service_days is None:
+        service_days = sorted(nodes["service_day"].drop_duplicates().tolist())
+    n = len(service_days)
     ncols = min(max_cols, n)
     nrows = int(np.ceil(n / ncols))
 
-    fig = make_subplots(rows=nrows, cols=ncols, shared_xaxes=False, shared_yaxes=False,
-                        horizontal_spacing=0.04, vertical_spacing=0.08,
-                        subplot_titles=[f"{by}={k}" for k in keys])
+    fig = make_subplots(rows=nrows, cols=ncols,
+                        shared_xaxes=False, shared_yaxes=False,
+                        subplot_titles=[str(pd.to_datetime(d).date()) for d in service_days],
+                        horizontal_spacing=0.04, vertical_spacing=0.08)
 
     r = c = 1
-    for i, k in enumerate(keys):
-        n_sub = nodes[nodes[by].eq(k)]
-        ids = set(n_sub["node_id"])
-        e_sub = edges[edges["src"].isin(ids) & edges["dst"].isin(ids)]
-        sub = plot_temporal_network(n_sub, e_sub, figsize=figsize_per, title=None)
+    for day in service_days:
+        nd = nodes[nodes["service_day"].eq(pd.to_datetime(day))]
+        ids = set(nd["node_id"])
+        ed = edges[edges["src"].isin(ids) & edges["dst"].isin(ids)]
 
-        # 各トレースをサブプロットへ移送
+        sub = plot_day_temporal_network(nd, ed, service_day=day, figsize=figsize_per, title=None)
         for tr in sub.data:
             fig.add_trace(tr, row=r, col=c)
 
-        # 軸体裁（軽め）
-        fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.07)", row=r, col=c)
+        # 軸：0..24固定
+        fig.update_xaxes(range=[0,24], showgrid=True, gridcolor="rgba(0,0,0,0.07)", row=r, col=c)
         fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.07)", row=r, col=c)
 
         c += 1
@@ -326,152 +337,76 @@ def facet_temporal_network(
             r += 1
 
     fig.update_layout(
-        title=title_prefix + f"Facet by {by}",
+        title=title,
         width=figsize_per[0]*ncols,
         height=figsize_per[1]*nrows + 60,
         showlegend=False,
         plot_bgcolor="white",
-        margin=dict(l=60, r=20, t=80, b=40)
+        margin=dict(l=60, r=20, t=80, b=50)
     )
     return fig
 
 
 # =========================================================
-# 定量評価：遷移確率・エントロピー・中心性・条件付き放置
+# 定量評価（1日ビューに対応）
 # =========================================================
-def compute_transition_stats(
+def compute_day_transition_stats(
     nodes: pd.DataFrame,
     edges: pd.DataFrame
-) -> Dict[str, pd.DataFrame | float]:
-    """
-    出力:
-      - trans_matrix: prev x next の 回数/確率
-      - entropy_by_prev: H(next|prev)
-      - p_long_after_charge / p_long_after_noncharge
-      - centrality: 遷移グラフの中心性（入次数/出次数/PageRank など）
-      - top_transitions: 上位遷移
-    """
-    e = (
-        edges.merge(nodes[["node_id","cluster_id","sessionType","is_long_parking"]],
-                    left_on="src", right_on="node_id", how="left")
-             .rename(columns={"cluster_id":"cluster_src","sessionType":"type_src","is_long_parking":"long_src"})
-             .drop(columns=["node_id"])
-    )
-    e = (
-        e.merge(nodes[["node_id","cluster_id","sessionType","is_long_parking"]],
-                left_on="dst", right_on="node_id", how="left")
-             .rename(columns={"cluster_id":"cluster_dst","sessionType":"type_dst","is_long_parking":"long_dst"})
-             .drop(columns=["node_id"])
-    )
-
-    # 遷移行列
-    counts = e.groupby(["cluster_src","cluster_dst"]).size().rename("n").reset_index()
-    totals = counts.groupby("cluster_src")["n"].sum().rename("row_total").reset_index()
-    mat = counts.merge(totals, on="cluster_src", how="left")
-    mat["p"] = mat["n"]/mat["row_total"]
-
-    # エントロピー H(next|prev)
-    entropy_df = (
-        mat.groupby("cluster_src")["p"]
-           .apply(lambda s: float(-(s*np.log2(np.clip(s, 1e-12, 1))).sum()))
-           .rename("H_next_given_prev").reset_index()
-    )
-
-    # 充電直後に long parking になる確率
-    charge_edges = e[e["type_src"].eq("charging")]
-    noncharge_edges = e[~e["type_src"].eq("charging")]
-    p_long_after_charge = float(charge_edges["long_dst"].mean()) if len(charge_edges)>0 else np.nan
-    p_long_after_noncharge = float(noncharge_edges["long_dst"].mean()) if len(noncharge_edges)>0 else np.nan
-
-    # グラフ中心性（重み=回数）
-    G = nx.DiGraph()
-    for _, r in counts.iterrows():
-        G.add_edge(r["cluster_src"], r["cluster_dst"], weight=int(r["n"]))
-    in_deg  = pd.Series(dict(G.in_degree(weight="weight")),  name="in_degree_w")
-    out_deg = pd.Series(dict(G.out_degree(weight="weight")), name="out_degree_w")
-    try:
-        pr = pd.Series(nx.pagerank(G, weight="weight"), name="pagerank")
-    except Exception:
-        pr = pd.Series(dtype=float, name="pagerank")
-
-    centrality = (
-        pd.concat([in_deg, out_deg, pr], axis=1)
-          .fillna(0.0)
-          .sort_values("pagerank", ascending=False)
-          .reset_index().rename(columns={"index":"cluster_id"})
-    )
-
-    top_transitions = mat.sort_values("n", ascending=False).head(30).reset_index(drop=True)
-
-    return {
-        "trans_matrix": mat,
-        "entropy_by_prev": entropy_df,
-        "p_long_after_charge": p_long_after_charge,
-        "p_long_after_noncharge": p_long_after_noncharge,
-        "centrality": centrality,
-        "top_transitions": top_transitions
-    }
-
-
-def compute_transition_stats_by(
-    nodes: pd.DataFrame,
-    edges: pd.DataFrame,
-    by: Literal["weekday","month"] = "weekday"
 ) -> pd.DataFrame:
     """
-    曜日・月などで条件分割したときの p_long_after_charge などを算出。
-    返り値: key, p_long_after_charge, p_long_after_noncharge, diff
+    サービス日ごとの遷移統計を返す（遷移行列・H(next|prev)・充電直後の長期放置率）。
+    出力: service_day, p_long_after_charge, p_long_after_noncharge, diff, entropy_mean
     """
     out = []
-    for key, n_sub in nodes.groupby(by):
-        ids = set(n_sub["node_id"])
-        e_sub = edges[edges["src"].isin(ids) & edges["dst"].isin(ids)]
-        st = compute_transition_stats(n_sub, e_sub)
+    for day, nd in nodes.groupby("service_day"):
+        ids = set(nd["node_id"])
+        ed = edges[edges["src"].isin(ids) & edges["dst"].isin(ids)]
+
+        # 遷移レコード作成
+        e = (
+            ed.merge(nd[["node_id","cluster_id","sessionType","is_long_parking"]],
+                     left_on="src", right_on="node_id", how="left")
+              .rename(columns={"cluster_id":"cluster_src","sessionType":"type_src","is_long_parking":"long_src"})
+              .drop(columns=["node_id"])
+        )
+        e = (
+            e.merge(nd[["node_id","cluster_id","sessionType","is_long_parking"]],
+                    left_on="dst", right_on="node_id", how="left")
+              .rename(columns={"cluster_id":"cluster_dst","sessionType":"type_dst","is_long_parking":"long_dst"})
+              .drop(columns=["node_id"])
+        )
+        if len(e) == 0:
+            out.append({"service_day": day, "p_long_after_charge": np.nan,
+                        "p_long_after_noncharge": np.nan, "diff": np.nan, "entropy_mean": np.nan})
+            continue
+
+        # 条件付き確率
+        counts = e.groupby(["cluster_src","cluster_dst"]).size().rename("n").reset_index()
+        totals = counts.groupby("cluster_src")["n"].sum().rename("row_total").reset_index()
+        mat = counts.merge(totals, on="cluster_src", how="left")
+        mat["p"] = mat["n"] / mat["row_total"]
+
+        # H(next|prev) の日内平均
+        ent = (
+            mat.groupby("cluster_src")["p"]
+               .apply(lambda s: float(-(s*np.log2(np.clip(s,1e-12,1))).sum()))
+               .rename("H").reset_index()
+        )
+        entropy_mean = float(ent["H"].mean()) if len(ent) > 0 else np.nan
+
+        # 充電直後に長期放置？
+        ce = e[e["type_src"].eq("charging")]
+        nce = e[~e["type_src"].eq("charging")]
+        p_long_after_charge = float(ce["long_dst"].mean()) if len(ce) > 0 else np.nan
+        p_long_after_noncharge = float(nce["long_dst"].mean()) if len(nce) > 0 else np.nan
+
         out.append({
-            by: key,
-            "p_long_after_charge": st["p_long_after_charge"],
-            "p_long_after_noncharge": st["p_long_after_noncharge"],
-            "diff": (st["p_long_after_charge"] - st["p_long_after_noncharge"])
+            "service_day": day,
+            "p_long_after_charge": p_long_after_charge,
+            "p_long_after_noncharge": p_long_after_noncharge,
+            "diff": (p_long_after_charge - p_long_after_noncharge),
+            "entropy_mean": entropy_mean
         })
-    return pd.DataFrame(out).sort_values(by).reset_index(drop=True)
 
-
-# =========================================================
-# 使い方（サンプル）
-# =========================================================
-if __name__ == "__main__":
-    # 1) セッションデータを読み込む
-    # df = pd.read_parquet("sessions.parquet")
-    # 必須列: sessionType, start_time, end_time, cluster_id, duration_minutes
-
-    # # 2) ノード/エッジ生成
-    # nodes, edges, meta = build_temporal_network(
-    #     df,
-    #     top_n_clusters=12,
-    #     lane_offset_for_charging=0.5,
-    #     edge_stride=1,
-    #     edge_anchor=("end","start")  # 前の終了 → 次の開始で接続（推奨）
-    # )
-
-    # # 3) 全期間の図
-    # fig = plot_temporal_network(nodes, edges, title="All Period")
-    # fig.show()
-
-    # # 4) 曜日ファセット
-    # fig_w = facet_temporal_network(nodes, edges, by="weekday", order=[0,1,2,3,4,5,6],
-    #                                title_prefix="User A — ")
-    # fig_w.show()
-
-    # # 5) 月別ファセット
-    # fig_m = facet_temporal_network(nodes, edges, by="month", order=list(range(1,13)),
-    #                                title_prefix="User A — ")
-    # fig_m.show()
-
-    # # 6) 定量評価
-    # stats = compute_transition_stats(nodes, edges)
-    # print(stats["centrality"].head(10))
-    # print(stats["entropy_by_prev"].sort_values("H_next_given_prev").head(10))
-    # print("p_long_after_charge =", stats["p_long_after_charge"])
-    # print("p_long_after_noncharge =", stats["p_long_after_noncharge"])
-
-    pass
+    return pd.DataFrame(out).sort_values("service_day").reset_index(drop=True)
