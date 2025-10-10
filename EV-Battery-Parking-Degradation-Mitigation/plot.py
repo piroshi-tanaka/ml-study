@@ -1,4 +1,4 @@
-# tod_transition_network.py
+=# tod_transition_network.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import pandas as pd, numpy as np
@@ -239,4 +239,30 @@ def plot_timeband_network(
     )
     fig.update_xaxes(visible=False)
     fig.update_yaxes(visible=False)
-    return fig
+    return from tod_transition_network import (
+    build_time_binned_bundle, compute_global_layout, plot_timeband_network
+)
+
+# df: 必須列 → start_time, end_time, sessionType, cluster_id, duration_min
+bundle = build_time_binned_bundle(
+    df,
+    col_type="sessionType",
+    col_start="start_time",
+    col_end="end_time",
+    col_cluster="cluster_id",
+    col_duration_min="duration_min",
+    min_stop_minutes=30,       # 30分未満は除外
+    drop_moving=True,          # movingは除外
+    day_start_hour=4,          # 04:00起点
+    hour_bins=[(0,6),(6,10),(10,16),(16,20),(20,24)]  # 変更可
+)
+
+layout_xy = compute_global_layout(bundle["global_edges"], seed=42)
+
+fig = plot_timeband_network(
+    bundle, layout_xy,
+    top_k_nodes=18,       # 時間帯ごとに上位クラスタだけ表示
+    edge_min_count=3,     # 回数が少ない遷移は非表示
+    edge_min_prob=0.05    # 条件付確率が低い遷移は非表示
+)
+fig.show()
