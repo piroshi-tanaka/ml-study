@@ -1,225 +1,123 @@
-# EV バッテリ劣化抑制\_放置予測 — CodeX 要件書（改訂版）
+# EVバッテリ劣化抑制_放置予測 — 要件書（最終/簡潔版）
 
-## 0. 概要
-
-- **目的**:  
-  EV ユーザーが充電ステーションを利用した後、どこで長時間（≥6h）放置する傾向があるかを可視化し、  
-  「充電時点での行動予測モデル」構築に向けた EDA を行う。  
-  特に、充電前後の行動パターンや時間帯・曜日・充電開始時刻の影響を明確化する。
-
-- **対象フェーズ**: PoC（Jupyter ベース EDA）
-- **分析単位**: `hashvin`（車両）ごと
 
 ---
 
-## 1. あなた（ChatGPT）のロール
-
-- 機械学習・データ分析・EV 領域の専門家として、  
-  CodeX での EDA スクリプト設計・自動化テンプレートの生成を支援する。
-- Notebook レベルで再利用可能な EDA 可視化コードを出力する。
-
----
-
-## 2. データ仕様（入力）
-
-**1 行＝ 1 セッションイベント（充電または放置）**
-
-| 列名                                           | 説明                           |
-| ---------------------------------------------- | ------------------------------ |
-| `session_cluster`                              | 滞在クラスタ ID（DBSCAN 結果） |
-| `session_type`                                 | {`inactive`, `charging`}       |
-| `start_time`                                   | 滞在/充電開始時刻              |
-| `end_time`                                     | 滞在/充電終了時刻              |
-| `duration_minutes`                             | 滞在/充電継続時間              |
-| `start_soc`, `end_soc`, `change_soc`           | SOC 関連値                     |
-| `start_lat`, `start_lon`, `end_lat`, `end_lon` | 位置座標                       |
-
-**除外条件**:
-
-- 移動中セッション、および「充電してその場に留まる」イベントは除外済み。
+## 0. 目的
+- 充電イベントの **直後に最初に発生する長時間放置（≥6h）** を厳密にリンク化し、  
+  **充電開始の時間帯×充電クラスタ → 放置開始の時間帯×放置クラスタ** の関係を可視化・定量化。
+- さらに **1日単位の遷移** と **充電あり日 vs なし日** を比較し、  
+  充電が日常ルートへの“挿入”か“独立行動”かを判定する。
 
 ---
 
-## 3. 派生列（EDA 処理で追加）
-
-| 列名                                | 内容                                                 |
-| ----------------------------------- | ---------------------------------------------------- |
-| `weekday`                           | `start_time.dayofweek`（0=Mon,…,6=Sun）              |
-| `start_hour`                        | `start_time.hour`                                    |
-| `is_long_park`                      | `session_type=='inactive'` & `duration_minutes>=360` |
-| `prev_session_type`, `prev_cluster` | 直前セッション情報（shift(+1))                       |
-| `next_session_type`, `next_cluster` | 直後セッション情報（shift(-1))                       |
-| `after_charge`                      | `inactive`かつ`prev_session_type=='charging'`        |
-| `charge_start_hour`                 | `start_hour`（充電セッションのみ）                   |
-| `date`                              | `start_time.dt.date`（充電有無日比較に使用）         |
+## 1. スコープ/前提
+- すべて **hashvin単位** で前処理・集計・可視化を行う。
+- 入力はセッション単位（滞在 `inactive` / 充電 `charging`）。移動中・停滞充電は除外済み。
+- タイムゾーン: Asia/Tokyo、長時間放置: `duration_minutes ≥ 360`。
 
 ---
 
-## 4. 分析構成（再設計版）
-
-| Step | テーマ                 | 目的                                                        | 出力可視化                       |
-| ---- | ---------------------- | ----------------------------------------------------------- | -------------------------------- |
-| 1    | 放置場所分布           | 各車両の長時間放置クラスタ傾向を把握                        | 棒グラフ                         |
-| 2    | 滞在傾向＋充電時刻影響 | 曜日 × 時間帯の滞在傾向＋充電後偏り＋充電開始時刻による影響 | ヒートマップ＋条件付き棒グラフ   |
-| 3    | 充電前後遷移比較       | 充電前後・充電有無日別の行動遷移傾向を把握                  | ネットワーク図＋ヒートマップ差分 |
+## 2. 入力列
+- `hashvin, session_cluster, session_type(inactive/charging), start_time, end_time, duration_minutes, start_soc, end_soc, change_soc, start_lat, start_lon, end_lat, end_lon`
 
 ---
 
-## 5. Step 詳細と可視化仕様
-
-### 🟦 Step 1：放置場所の全体傾向（Bar Plot）
-
-**目的**: 各車両がどのクラスタで長時間放置しているかの全体像を把握。  
-**対象**: `session_type=='inactive'` & `duration_minutes>=360`
-
-- 集計単位：`hashvin × session_cluster`
-- 指標：総滞在時間[h]
-- 出力：棒グラフ（降順、上位 10 クラスタ）
-- 次工程：上位 5 クラスタを Step2 の可視化対象とする
+## 3. 派生列（hashvinごと）
+- `weekday = start_time.dayofweek`（0=Mon…6=Sun）
+- `start_hour = start_time.hour`
+- `date = start_time.date`
+- `is_long_park = (session_type=='inactive') & (duration_minutes>=360)`
+- `prev_* / next_*`（シフトで直前・直後の種別/クラスタ/時間を参照：可視化補助）
 
 ---
 
-### 🟩 Step 2：クラスタ別・曜日 × 時間帯ヒートマップ（充電後偏り＋充電時刻影響）
-
-**目的**
-
-- 「どの時間帯・曜日にどのクラスタに長時間滞在するか」
-- 「充電後に偏る時間帯や曜日」
-- 「充電開始時刻が次放置先に与える影響」
-
-**データ**
-
-- 長時間放置イベントのみ（`inactive & duration_minutes>=360`）
-- `after_charge`フラグを使用（充電後放置のみ抽出）
-
-**処理**
-
-1. 放置イベントを 15 分スロット展開し、`weekday×hour`で滞在集計
-2. 上位 5 クラスタについて、以下の 3 種ヒートマップを作成
-   - 全体滞在（All long inactive）
-   - 充電後滞在（After-charge）
-   - 差分（After-charge − All）
-3. 充電開始時刻の影響可視化
-   - 条件付き棒グラフ：  
-     x=`charge_start_hour`、y=`P(next_long_park_cluster=c)`  
-     facet：`charge_cluster` or `weekday`
+## 4. 充電→長時間放置リンク（確定ルール）
+- 各充電イベント **c** の終了から **次の充電イベント開始まで** の区間内にある  
+  **最初の長時間放置（`is_long_park==True`）** をリンク（**1件のみ**）。
+- 区間内に長時間放置が **存在しない** 場合はリンク **なし** とする。
+- リンクテーブル列（例）  
+  `hashvin, weekday, charge_cluster, charge_start_time, charge_start_hour, charge_end_time, park_cluster(NA可), park_start_time(NA), park_start_hour(NA), park_duration_minutes(NA), gap_minutes(NA), dist_charge_to_park_km(任意)`
 
 ---
 
-### 🟨 Step 3：充電前後遷移と充電有無日比較
+## 5. ミックス集計（充電×放置の“対”）
+### 5.1 集約定義
+- **集約版（充電クラスタ無指定）**  
+  `count(h_c, h_p, c_p)` … 充電開始時刻 `h_c`、放置開始時刻 `h_p`、放置クラスタ `c_p`
+- **充電クラスタ別**  
+  `count(c_c, h_c, h_p, c_p)` … 充電クラスタ `c_c` を条件に加える
 
-#### 3-A. 充電前の遷移（どこから充電に来るか）
-
-- 対象：`session_type=='charging'`
-- 直前セッション：`prev_cluster`
-- 集計：`P(charge_cluster | prev_cluster, charge_start_hour, weekday)`
-- 可視化：
-  - ネットワーク図（prev_cluster → charge_cluster）
-  - ヒートマップ（x=hour, y=prev_cluster, color=頻度）
-
-#### 3-B. 充電後の遷移（どこに放置するか）
-
-- 対象：`charging` → `inactive & is_long_park==1`
-- 集計：`P(next_cluster | charge_cluster, charge_start_hour, weekday)`
-- 可視化：
-  - ネットワーク図（charge_cluster → next_long_park_cluster）
-  - 確率棒グラフ（x=hour, y=prob, hue=next_cluster）
-
-#### 3-C. 充電あり日 vs なし日 の日次遷移比較
-
-- 定義：
-  - 充電あり日：同一`date`内に`charging`が存在
-  - 充電なし日：存在しない日
-- 抽出：
-  - 日ごとの`inactive`遷移（`cluster_i → cluster_j`）を集計
-- 出力：
-  1. `T_charge` / `T_nocharge` の遷移確率行列ヒートマップ
-  2. 差分ヒートマップ（`T_charge - T_nocharge`）
-  3. 距離指標（Jensen–Shannon 距離 or TV 距離）
+### 5.2 条件付き確率（平滑化推奨）
+- `P(c_p | h_c, h_p)`、`P(c_p | c_c, h_c, h_p)` を列正規化（疎セルは閾値でNA、+α平滑化）。
 
 ---
 
-## 6. 可視化サマリ表
-
-| 可視化種別               | 対象                              | 目的                         |
-| ------------------------ | --------------------------------- | ---------------------------- |
-| 棒グラフ                 | 長時間放置クラスタ分布            | 放置拠点の把握               |
-| ヒートマップ ×3          | 上位 5 クラスタの全体/充電後/差分 | 時間・曜日傾向＋充電後偏り   |
-| 棒グラフ（条件付き）     | 充電開始時刻 × 放置確率           | 充電時刻の影響確認           |
-| ネットワーク図（充電前） | prev→charge                       | 充電行動の文脈を把握         |
-| ネットワーク図（充電後） | charge→long park                  | 充電後放置遷移の定型化を確認 |
-| 遷移行列ヒートマップ     | 充電あり/なし日比較               | 日常行動への影響を確認       |
-| 差分ヒートマップ         | T_charge−T_nocharge               | 行動パターン変化を定量化     |
+## 6. 日内遷移（1日区切り・時間区間の“存在判定”）
+- **スロット化は行わない**。各 `inactive` の **区間 [start_time, end_time)** が  
+  時間帯ビン（例 `0–6, 6–9, 9–12, 12–15, 15–18, 18–21, 21–24`）に **重なっているか（存在判定）** を用いる。
+- 日ごとにビン順で「代表クラスタ」（該当区間に**存在したクラスタ**のうち、時間重複量が最大のもの等）を決め、  
+  `(time_bin, cluster)` 列の連鎖として **日内遷移** を構築。
+- エッジは **隣接ビン間** の `(bin_i, cluster_i) → (bin_j, cluster_j)` をカウント。
 
 ---
 
-## 7. 実装要点（共通）
-
-- `groupby('hashvin')`で逐次シフトし、`prev_*`/`next_*`を生成
-- 15 分スロット展開：`pd.date_range(start, end, freq='15T')`
-- ネットワーク描画：`networkx`
-- 可視化：`matplotlib`, `seaborn`
-- サマリ指標計算：`scipy.spatial.distance.jensenshannon`
-
----
-
-## 8. 出力成果物
-
-- 図表：
-  - `bar_cluster_distribution.png`
-  - `heatmap_cluster_[1-5]_all.png`
-  - `heatmap_cluster_[1-5]_aftercharge.png`
-  - `heatmap_cluster_[1-5]_diff.png`
-  - `network_before_charge.png`
-  - `network_after_charge.png`
-  - `transition_matrix_diff.png`
-- テーブル：
-  - `transition_prob_before.csv`
-  - `transition_prob_after.csv`
-  - `transition_diff_metrics.csv`
+## 7. 充電あり日 vs なし日（比較設計）
+- `has_charge_day(date)` を作成（その日のセッションに charging が1つでもあれば True）。
+- 比較対象：
+  - **日内クラスタ分布**（hour×cluster の存在比）  
+  - **日内遷移行列 T**（クラスタ間の隣接遷移確率）
+- 指標：
+  - **JS距離**（分布差）  
+  - **ΔT = T_charge − T_nocharge**（遷移差のヒートマップ）  
+  - **route_return_ratio**（充電後 N 時間以内に“充電前の主クラスタ”へ戻る確率）  
+  - **charge_specific_ratio**（充電日の「charging→近距離短時間park→移動」割合）
 
 ---
 
-## 9. 評価・モデル接続想定
+## 8. 可視化（hashvinごと）
+### 8.1 ミックス（充電×放置）
+- **H2Dヒートマップ（集約版）**  
+  - 軸: y=充電開始 `h_c`、x=放置開始 `h_p`  
+  - 値: Top1放置クラスタ確率 or エントロピー  
+  - 目的: 「この時間に充電 → 何時からどの放置先？」を俯瞰
+- **H2Dヒートマップ（充電クラスタ別）**  
+  - 小倍数（facet）で `charge_cluster` ごと表示  
+  - 目的: ステーション固有の偏りを把握
+- **条件付き棒グラフ（充電クラスタ別）**  
+  - x=`h_c`、y=`P(next_cluster | c_c, h_c, h_p_bin)`、hue=`next_cluster`、facet=`h_p_bin`  
+  - 目的: 実務で使う「時間帯×拠点→放置先」地図
 
-EDA で確認された構造をもとに、以下特徴量を抽出して  
-放置先クラスタ予測モデルに活用。
+### 8.2 日内遷移（存在判定ビン）
+- **Sankey / 時系列ネットワーク**  
+  - ノード=`(time_bin, cluster)`、リンク幅=件数  
+  - 目的: 「朝A→午前B→夕C→夜A」のループや分岐
+- **Timeline Heatmap**  
+  - y=cluster、x=hour、値=**存在割合**（区間重なりがあれば1として集計）  
+  - 目的: 各クラスタの“活動時間帯”を俯瞰
 
-| 特徴量名                                  | 説明                 |
-| ----------------------------------------- | -------------------- |
-| `weekday`, `hour`                         | 曜日・時間帯         |
-| `charge_cluster`, `charge_start_hour`     | 充電条件             |
-| `stay_prob_all`, `stay_prob_after_charge` | 通常／充電後滞在確率 |
-| `transition_prob_before/after`            | 前後遷移確率         |
-| `long_park_ratio`                         | クラスタ長時間滞在率 |
-| `has_charge_day`                          | その日の充電有無     |
-| `dist(prev, charge)`                      | 移動距離特徴（任意） |
-
----
-
-## 10. 受け入れ基準
-
-- [ ] Step1：クラスタごとの棒グラフが生成される（上位クラスタ選出可能）
-- [ ] Step2：上位 5 クラスタの全体/充電後/差分ヒートマップ＋充電時刻影響グラフが描画される
-- [ ] Step3：充電前後のネットワーク図＋充電有無日比較の行列ヒートマップが出力される
-- [ ] 差分や距離指標が計算され、出力ファイルとして保存される
-- [ ] Notebook は`hashvin`単位で切替可能
-
----
-
-## 11. 非スコープ
-
-- 学習モデル構築（AutoGluon など）は次フェーズ
-- リアルタイム推論、API 化
-- 交通・天候・地図連携
+### 8.3 充電あり日 vs なし日
+- **分布差分ヒートマップ**（hour×cluster の存在割合：charge − nocharge）
+- **遷移行列差分ヒートマップ**（ΔT）
+- **指標棒グラフ**（route_return_ratio / js_distance / charge_specific_ratio）
 
 ---
 
-## 12. 成果物
-
-- Notebook: `eda_ev_parking_behavior.ipynb`
-- 可視化画像：`/outputs/plots/`
-- 集計テーブル：`/outputs/tables/`
-- Markdown レポート：`eda_summary.md`
+## 9. この設計で傾向が分かる理由
+- **充電→最初の長時間放置**のみをリンクし、**次の充電まで**を上限とすることで、  
+  「充電が引き起こす直後の主要放置」をノイズなく抽出できる（因果連鎖に近い）。
+- **時間×場所の条件付き確率**で見るため、  
+  「この時間にこの拠点で充電 → この時間からこの放置先」という **予測構造** が可視化される。
+- **スロット化せず区間重なりの“存在判定”**を用いることで、  
+  時間帯ごとの **実在性** に基づく日内遷移を歪み少なく表現できる。
+- **充電あり/なしの差分**と **復帰率指標** により、  
+  充電が日常ルートの **挿入イベント** か **独立行動** かを定量的に切り分けられる。
 
 ---
+
+## 10. 受け入れ基準（AC）
+- [ ] 充電ごとに、「次の充電まで」の間で **最初の長時間放置のみ** をリンクし、該当なしは **リンクなし** を表現できている。  
+- [ ] `P(c_p | h_c, h_p)`（集約）と `P(c_p | c_c, h_c, h_p)`（充電クラスタ別）が算出され、疎セルは適切に扱う。  
+- [ ] H2Dヒートマップ（集約/拠点別）と条件付き棒が意図通り描画される。  
+- [ ] 日内遷移（Sankey/Network）と Timeline Heatmap が「存在判定」に基づき描画される。  
+- [ ] 充電あり日 vs なし日で、分布・遷移の差分と指標（復帰率/JS距離/特化比率）が比較できる。
