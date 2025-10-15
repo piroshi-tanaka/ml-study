@@ -21,8 +21,8 @@ AutoGluon の二値分類（正例=実際に発生した放置クラスタ）と
   3) compute_cluster_centroids_by_vehicle:
      車両×放置クラスタごとの代表座標（start_lat/lon の平均）を計算します。
   4) build_candidate_pool_per_vehicle:
-     車両内の長時間放置クラスタ出現頻度 Top-N を候補集合として作成し、
-     履歴が乏しい場合は全体 Top-N で補完します。
+     車両単位で長時間放置クラスタの滞在時間を合計し、長い順に Top-N の候補プールを作成します。
+     ここで得た候補は静的な土台であり、最終候補は `pipeline.generate_candidates` が文脈に応じて組み直します。
   5) build_ranking_training_data:
      各充電イベントに対して候補クラスタを展開し、特徴量を組み立て、
      真の放置クラスタには label=1、それ以外は label=0 を付与した学習用データを返します。
@@ -263,31 +263,32 @@ def _popularity(series: pd.Series) -> pd.Series:
 def build_candidate_pool_per_vehicle(
     df: pd.DataFrame,
     top_n_per_vehicle: int = 10,
-    global_top_n: int = 20,
 ) -> Dict[str, List[int]]:
     """
-    車両ごとの長時間放置履歴から、頻出クラスタ Top-N を候補集合として作成します。
-    履歴が少ない（または存在しない）車両については、全体 Top-N のクラスタを候補として補完します。
-    返り値: {hashvin: [cluster_id, ...]}
+    車両ごとの長時間放置履歴を集計し、滞在時間の長い順で Top-N 候補プールを作成する。
+    ここで得た候補は学習前処理で使う静的な下地であり、充電イベントごとの最終候補は
+    `pipeline.generate_candidates` が曜日・時間帯・充電クラスタなどの文脈を踏まえて組み直す。
+    戻り値: {hashvin: [cluster_id, ...]}
     """
     parks = df[(df["session_type"] == "inactive") & (df["is_long_park"] == True)].copy()  # noqa: E712
-    # Per vehicle top-N
+    parks["duration_minutes"] = pd.to_numeric(parks["duration_minutes"], errors="coerce").fillna(0.0)
+
     per_vehicle: Dict[str, List[int]] = {}
     for hv, g in parks.groupby("hashvin"):
         top = (
-            g["session_cluster"].value_counts().head(int(top_n_per_vehicle)).index.to_list()
+            g.groupby("session_cluster")["duration_minutes"].sum()
+            .sort_values(ascending=False)
+            .head(int(top_n_per_vehicle))
+            .index.to_list()
         )
         per_vehicle[str(hv)] = [int(x) for x in top]
 
-    # Global fallback
-    global_top = parks["session_cluster"].value_counts().head(int(global_top_n)).index.to_list()
-    global_top = [int(x) for x in global_top]
-
-    # Ensure each hv has some candidates
+    # 履歴が存在しない車両は空リストのまま扱い、generate_candidates が文脈から補完する
     for hv in df["hashvin"].unique():
         hv = str(hv)
-        if hv not in per_vehicle or len(per_vehicle[hv]) == 0:
-            per_vehicle[hv] = global_top.copy()
+        if hv not in per_vehicle:
+            per_vehicle[hv] = []
+
     return per_vehicle
 
 
