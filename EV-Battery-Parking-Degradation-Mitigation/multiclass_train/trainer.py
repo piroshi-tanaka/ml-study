@@ -1,6 +1,9 @@
-"""
-Training and evaluation helpers for AutoGluon Tabular models.
-"""
+﻿"""
+AutoGluon Tabular を用いた学習・評価ユーティリティ。
+
+- §6: AutoGluonによる学習設定とハイパーパラメータ指定
+- §7: 指定された評価指標（Top-1, クラス別Recall, 混同行列, Top-1@τ）を算出
+- §8: 結果一式（特徴量CSV・予測CSV・metrics.json・HEAD情報）を保存"""
 from __future__ import annotations
 
 import json
@@ -12,10 +15,11 @@ import pandas as pd
 from autogluon.tabular import TabularPredictor
 from sklearn.metrics import accuracy_score, confusion_matrix
 
-from .pipeline import OTHER_LABEL, HashvinResult, HeadClusterInfo, save_head_details
+from .pipeline import HashvinResult, save_head_details
 
 
 def _select_feature_columns(df: pd.DataFrame, enable_station_type: bool) -> List[str]:
+    """パイプラインで生成した列のうち、学習に投入する対象を整理（§4, §6）。"""
     base_cols = [
         "dow",
         "hour_sin",
@@ -43,17 +47,20 @@ def _select_feature_columns(df: pd.DataFrame, enable_station_type: bool) -> List
 
 
 def _prepare_training_frame(df: pd.DataFrame, feature_cols: List[str], label: str) -> pd.DataFrame:
+    """特徴列と目的変数だけを抽出したDataFrameを返す。"""
     keep_cols = feature_cols + [label]
     return df[keep_cols].copy()
 
 
 def _save_split_tables(result: HashvinResult, output_dir: Path) -> None:
+    """train/valid/testの特徴テーブルをCSVで保存（§5の出力要件）。"""
     for split, df in result.split_datasets.items():
         path = output_dir / f"features_{split}.csv"
         df.to_csv(path, index=False)
 
 
 def _compute_head_confusion(y_true: pd.Series, y_pred: pd.Series, head_clusters: List[str]) -> Dict[str, object]:
+    """HEAD間の混同行列を算出（§7-4）。"""
     if y_true.empty or not head_clusters:
         return {"labels": [], "matrix": []}
     mask = y_true.isin(head_clusters)
@@ -64,6 +71,7 @@ def _compute_head_confusion(y_true: pd.Series, y_pred: pd.Series, head_clusters:
 
 
 def _compute_class_recalls(y_true: pd.Series, y_pred: pd.Series, head_clusters: List[str]) -> Dict[str, Optional[float]]:
+    """クラス別Recall（HEADクラスのみ）を計算（§7-3）。"""
     recalls: Dict[str, Optional[float]] = {}
     for cid in head_clusters:
         mask = y_true == cid
@@ -80,6 +88,7 @@ def _compute_threshold_metrics(
     proba_df: pd.DataFrame,
     thresholds: Iterable[float],
 ) -> Dict[str, Dict[str, Optional[float]]]:
+    """Top-1@τ の Coverage/Accuracy を算出しレポート用にまとめる（§7 任意指標）。"""
     if proba_df.empty:
         return {str(t): {"coverage": None, "accuracy": None} for t in thresholds}
     max_proba = proba_df.max(axis=1)
@@ -101,6 +110,7 @@ def _save_predictions(
     proba_df: pd.DataFrame,
     output_path: Path,
 ) -> None:
+    """テストデータの予測結果と確率をCSV出力（§7, §8の可観測性向上）。"""
     export_df = df[["session_uid", "charge_end_time", "y_class"]].copy()
     export_df.rename(columns={"y_class": "y_true"}, inplace=True)
     export_df["y_pred"] = y_pred
@@ -120,7 +130,15 @@ def train_and_evaluate(
     autogluon_time_limit: Optional[int] = None,
     eval_thresholds: Iterable[float] = (0.5, 0.7, 0.9),
 ) -> Dict[str, object]:
+    """
+    要件§6（学習設定）・§7（評価指標）・§8（出力物）を一括で実行する。
+
+    - AutoGluon Tabular で学習（train/valid）
+    - testでTop-1 Accuracy（Strict/Head-only）、クラス別Recall、HEAD混同行列、Top-1@τを算出
+    - 各種CSV/JSONを `result/<hashvin>/` 配下に保存
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
+    # §8: 結果閲覧用に特徴テーブルとHEAD情報をディレクトリに保存
     _save_split_tables(result, output_dir)
     save_head_details(result.head_details, output_dir / "head_clusters.json")
 
@@ -129,10 +147,12 @@ def train_and_evaluate(
     valid_df = result.split_datasets.get("valid", pd.DataFrame())
     test_df = result.split_datasets.get("test", pd.DataFrame())
 
+    # §4・§6: 生成済み特徴から学習で使う列を抽出（ステーション種別はフラグで切替）
     feature_cols = _select_feature_columns(result.features, enable_station_type)
     if not feature_cols:
         raise ValueError("No feature columns selected. Check feature generation.")
 
+    # AutoGluonに渡すため train/valid/test を必要な列のみ抽出
     train_model_df = _prepare_training_frame(train_df, feature_cols, label_col)
     valid_model_df = _prepare_training_frame(valid_df, feature_cols, label_col) if not valid_df.empty else None
     test_model_df = _prepare_training_frame(test_df, feature_cols, label_col) if not test_df.empty else None
@@ -143,12 +163,14 @@ def train_and_evaluate(
         "feature_columns": feature_cols,
     }
 
+    # hashvinによっては教師データが不足するため、その際はスキップ情報を返す
     if train_model_df.empty or train_model_df[label_col].nunique() < 2:
         metrics["status"] = "skipped_training"
         metrics["reason"] = "Not enough labeled data to train a model."
         (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
         return metrics
 
+    # §6: AutoGluon Tabular で学習（評価指標は accuracy を指定）
     predictor_path = output_dir / "autogluon"
     predictor = TabularPredictor(
         label=label_col,
@@ -185,6 +207,7 @@ def train_and_evaluate(
     confusion = _compute_head_confusion(y_true, y_pred, result.head_clusters)
     threshold_metrics = _compute_threshold_metrics(y_true, y_pred, proba_df, eval_thresholds)
 
+    # §7: 必須指標（Top-1, クラス別Recall, 混同行列）と任意指標（Top-1@τ）を取りまとめる
     metrics.update(
         {
             "strict_top1_accuracy": strict_acc,
@@ -195,8 +218,8 @@ def train_and_evaluate(
         }
     )
 
+    # §7・§8: テストセットの予測詳細をCSVで保存し、分析できる状態にする
     _save_predictions(test_df, y_pred, proba_df, output_dir / "predictions_test.csv")
 
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
     return metrics
-

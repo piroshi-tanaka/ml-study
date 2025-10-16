@@ -1,8 +1,13 @@
-"""
-Pipeline utilities for EV long inactive location prediction.
+﻿"""
+EV長時間放置クラスタ予測の前処理パイプライン。
 
-This module implements the data preparation flow described in 要件.md.
-It handles per-hashvin processing, feature generation, and evaluation support.
+要件.md のMVP＋α要件（§0〜§8）に対応する補助関数と `HashvinProcessor` クラスを提供する。
+具体的な対応は以下の通り。
+
+- §0〜§2: hashvin完全独立・リーク防止・時系列Split → `ensure_datetime`, `assign_splits`, `_prepare_dataframe_types`
+- §3: HEADクラスタ抽出（K≤10＋OTHER） → `_select_head_clusters` 系列
+- §4: 共通特徴＋クラス依存特徴（距離/頻度/Recency/time_compat） → `_generate_common_features`, `_generate_class_feature_frame`
+- §5〜§7: 学習テーブル生成・教師整形・辞書出力 → `build_features`, `save_head_details`
 """
 from __future__ import annotations
 
@@ -10,7 +15,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,14 +23,14 @@ from pandas import Timestamp
 
 # Constants --------------------------------------------------------------------
 
-OTHER_LABEL = "OTHER"
+OTHER_LABEL = "OTHER"  # §3: HEAD外クラスをまとめるラベル
 EPS = 1e-9
 
 
 # Utilities --------------------------------------------------------------------
 
 def ensure_datetime(series: pd.Series) -> pd.Series:
-    """Convert a pandas Series to timezone-aware datetimes if necessary."""
+    """Seriesをタイムゾーン付きdatetime64に変換し、リークを防ぐ下準備とする。"""
     if pd.api.types.is_datetime64_any_dtype(series):
         if getattr(series.dt, "tz", None) is None:
             return series.dt.tz_localize("UTC")
@@ -34,7 +39,7 @@ def ensure_datetime(series: pd.Series) -> pd.Series:
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Compute Haversine distance in kilometers."""
+    """2地点のハバーサイン距離[km]を返す（§4.2 距離特徴用）。"""
     if any(pd.isna([lat1, lon1, lat2, lon2])):
         return float("nan")
     r = 6371.0
@@ -49,7 +54,7 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def log1p_safe(value: float) -> float:
-    """log1p with guard for negative tiny values that might appear via rounding."""
+    """距離等のゼロ付近をlog1pに通す際の丸め誤差ガード。"""
     if value < 0:
         value = 0.0
     return math.log1p(value)
@@ -57,9 +62,9 @@ def log1p_safe(value: float) -> float:
 
 def assign_splits(n_rows: int, train_ratio: float = 0.8, valid_ratio: float = 0.1) -> List[str]:
     """
-    Assign chronological splits with fallback for small sample counts.
+    時系列順のtrain/valid/test割当に加え、サンプルが少ない場合のフォールバックも実装する。
 
-    Returns a list with entries in {"train", "valid", "test"}.
+    要件§2の「過去のみで学習・辞書作成」を徹底するため、充電終了時刻の昇順に基づく。
     """
     if n_rows == 0:
         return []
@@ -81,7 +86,7 @@ def assign_splits(n_rows: int, train_ratio: float = 0.8, valid_ratio: float = 0.
 
 @dataclass
 class PipelineConfig:
-    """Configuration for per-hashvin feature generation."""
+    """hashvin単位の特徴生成設定（§0〜§5で指定されたパラメータ群）。"""
 
     head_k: int = 10
     min_long_inactive_minutes: int = 360
@@ -96,6 +101,7 @@ class PipelineConfig:
 
 @dataclass
 class HeadClusterInfo:
+    """HEADクラスタに関する指標（§3 指標A〜D）と辞書情報を保持する。"""
     cluster_id: str
     source: str  # "after_charge" or "anytime"
     count_after_charge: int = 0
@@ -124,6 +130,7 @@ class HeadClusterInfo:
 
 @dataclass
 class HashvinResult:
+    """ハッシュVIN単位の特徴テーブルとメタ情報（§5の出力）をパッケージ化。"""
     hashvin: str
     head_clusters: List[str]
     head_details: List[HeadClusterInfo]
@@ -135,6 +142,15 @@ class HashvinResult:
 # Core processing --------------------------------------------------------------
 
 class HashvinProcessor:
+    """
+    要件§0〜§8をhashvin単位で実装する前処理クラス。
+
+    主な役割:
+      - §0〜§2: 型変換と時系列Splitによりリークを防止
+      - §3: HEADクラスタ抽出（K≤10制約＋OTHERマージ）
+      - §4〜§5: 特徴量生成（共通＋クラス依存）と教師ラベル作成
+      - §7: 評価時に利用する辞書（HEAD情報）出力
+    """
     def __init__(
         self,
         hashvin: str,
@@ -149,7 +165,7 @@ class HashvinProcessor:
         self._prepare_dataframe_types()
 
     def _prepare_dataframe_types(self) -> None:
-        """Ensure required columns are present with correct dtypes."""
+        """入力データの型を整える（§0 リーク防止の前処理）。"""
         dt_cols_charge = ["charge_start_time", "charge_end_time", "inactive_start_time", "inactive_end_time"]
         for col in dt_cols_charge:
             if col in self.charge_df.columns:
@@ -181,6 +197,7 @@ class HashvinProcessor:
             )
 
     def _select_model_rows(self) -> pd.DataFrame:
+        """教師対象行のみを抽出し、充電終了時刻順に並べた学習基礎テーブルを返す（§1.2）。"""
         df = self.charge_df.copy()
         df = df[df["next_long_inactive_cluster"].notna()].copy()
         df.sort_values("charge_end_time", inplace=True)
@@ -190,6 +207,7 @@ class HashvinProcessor:
         return df
 
     def _head_from_after_charge(self, train_df: pd.DataFrame) -> pd.DataFrame:
+        """§3-1 充電直後6h放置実績（指標A/B）でHEAD候補を評価するための集計を返す。"""
         agg = (
             train_df.groupby("next_long_inactive_cluster")
             .agg(
@@ -202,6 +220,7 @@ class HashvinProcessor:
         return agg
 
     def _head_from_anytime(self, train_cutoff: Timestamp) -> pd.DataFrame:
+        """§3-2 日常長居地（指標C/D）でHEAD不足を補うための集計を返す。"""
         sessions = self.sessions_df.copy()
         sessions = sessions[
             (sessions["session_type"] == "inactive")
@@ -221,6 +240,7 @@ class HashvinProcessor:
         return agg
 
     def _select_head_clusters(self, train_df: pd.DataFrame) -> Tuple[List[str], List[HeadClusterInfo]]:
+        """§3 HEAD抽出：指標A/B優先、残りを指標C/Dで補完し、K≤10に制限した結果を返す。"""
         if train_df.empty:
             return [], []
 
@@ -268,6 +288,7 @@ class HashvinProcessor:
         train_df: pd.DataFrame,
         train_cutoff: Timestamp,
     ) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+        """§4.2 距離特徴用のクラスタ代表座標（中央値）をtrainデータから算出する。"""
         centroids: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
 
         # Primary source: train_df inactive coordinates
@@ -298,6 +319,7 @@ class HashvinProcessor:
         return centroids
 
     def _compute_delay_statistics(self, train_df: pd.DataFrame, head_clusters: Sequence[str]) -> Dict[str, float]:
+        """§4.2 time_compat用の遅延中央値（L̃）をクラスタ別に計算し、データ不足時は全体値で代替。"""
         if train_df.empty:
             return {cid: 0.0 for cid in head_clusters}
 
@@ -324,6 +346,7 @@ class HashvinProcessor:
         head_clusters: Sequence[str],
         train_cutoff: Timestamp,
     ) -> Dict[str, np.ndarray]:
+        """§4.2 time_compat の曜日×4hビン分布 p_start_Cj を作成（ラプラス平滑込み）。"""
         alpha = self.config.laplace_alpha
         bins_per_day = int(24 / self.config.time_bin_hours)
         matrices: Dict[str, np.ndarray] = {}
@@ -354,6 +377,7 @@ class HashvinProcessor:
         return matrices
 
     def _station_type_feature(self, df: pd.DataFrame) -> pd.DataFrame:
+        """§4.1 備考: 充電ステーション種別を後から有効化できるようOne-Hotを作成。"""
         if not self.config.enable_station_type:
             return pd.DataFrame(index=df.index)
         station_col = None
@@ -376,6 +400,7 @@ class HashvinProcessor:
         matrix: np.ndarray,
         delay_hours: float,
     ) -> float:
+        """充電開始時刻を遅延中央値だけシフトし、対応する曜日×時間帯の確率を返す（§4.2）。"""
         charge_start: Timestamp = row["charge_start_time"]
         if pd.isna(charge_start):
             return float(matrix.mean())
@@ -393,7 +418,108 @@ class HashvinProcessor:
         neighbor_score = matrix[dow, neighbor_bin]
         return float(0.75 * primary + 0.25 * neighbor_score)
 
+    def _generate_class_feature_frame(
+        self,
+        model_df: pd.DataFrame,
+        head_clusters: Sequence[str],
+        centroids: Dict[str, Tuple[Optional[float], Optional[float]]],
+        delays: Dict[str, float],
+        p_start: Dict[str, np.ndarray],
+    ) -> pd.DataFrame:
+        """
+        §4.2 クラス依存特徴（距離/頻度/Recency/time_compat）を横展開して生成する。
+
+        頻度・Recencyはtrain期間でのみ状態更新し、未来情報の混入を防ぐ（§0のリーク防止）。
+        """
+        feature_records: Dict[str, List[float]] = {}
+        for cid in head_clusters:
+            feature_records[f"dist_to_{cid}"] = []
+            feature_records[f"freq_hashvin_{cid}"] = []
+            feature_records[f"recency_{cid}_h"] = []
+            feature_records[f"time_compat_{cid}"] = []
+        freq_state = {cid: self.config.laplace_alpha for cid in head_clusters}
+        last_visit_state = {cid: None for cid in head_clusters}
+
+        for _, row in model_df.iterrows():
+            charge_lat = row.get("charge_lat")
+            charge_lon = row.get("charge_lon")
+            charge_end_time: Timestamp = row["charge_end_time"]
+
+            for cid in head_clusters:
+                centroid_lat, centroid_lon = centroids.get(cid, (None, None))
+                if centroid_lat is None or centroid_lon is None or pd.isna(charge_lat) or pd.isna(charge_lon):
+                    distance = float("nan")
+                else:
+                    distance = haversine_km(charge_lat, charge_lon, centroid_lat, centroid_lon)
+                feature_records[f"dist_to_{cid}"].append(log1p_safe(distance) if not math.isnan(distance) else float("nan"))
+                feature_records[f"freq_hashvin_{cid}"].append(freq_state.get(cid, self.config.laplace_alpha))
+
+                last_visit = last_visit_state.get(cid)
+                if last_visit is None:
+                    recency = self.config.recency_default_hours
+                else:
+                    delta = (charge_end_time - last_visit).total_seconds() / 3600.0
+                    recency = float(max(delta, 0.0))
+                feature_records[f"recency_{cid}_h"].append(recency)
+
+                matrix = p_start.get(cid)
+                delay = delays.get(cid, 0.0)
+                if matrix is None:
+                    feature_records[f"time_compat_{cid}"].append(1.0 / (7 * (24 // self.config.time_bin_hours)))
+                else:
+                    feature_records[f"time_compat_{cid}"].append(self._time_compat_score(row, matrix, delay))
+
+            if row["split"] == "train":
+                target = row["next_long_inactive_cluster"]
+                if target in head_clusters:
+                    freq_state[target] = freq_state.get(target, self.config.laplace_alpha) + 1.0
+                    last_visit_state[target] = row["inactive_start_time"]
+
+        return pd.DataFrame(feature_records, index=model_df.index)
+
+    def _generate_common_features(
+        self,
+        model_df: pd.DataFrame,
+        station_features: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        §4.1 共通特徴（曜日/時間/充電メタ/行動フェーズ）を生成し、必要に応じてステーション種別を連結。
+        """
+        dow = model_df["charge_end_time"].dt.weekday
+        hour = model_df["charge_end_time"].dt.hour + model_df["charge_end_time"].dt.minute / 60.0
+        hour_rad = 2 * math.pi * hour / 24.0
+
+        common_features = {
+            "dow": dow,
+            "hour_sin": np.sin(hour_rad),
+            "hour_cos": np.cos(hour_rad),
+            "charge_durations_minutes": model_df.get("charge_durations_minutes"),
+            "soc_start": model_df.get("charge_start_soc"),
+            "soc_end": model_df.get("charge_end_soc"),
+            "soc_delta": model_df.get("charge_end_soc") - model_df.get("charge_start_soc"),
+            # 行動フェーズの粗いフラグ（§4.1-3）
+            "is_return_band": ((model_df["charge_end_time"].dt.hour >= 18) | (model_df["charge_end_time"].dt.hour < 6)).astype(int),
+            "is_commute_band": (
+                ((model_df["charge_end_time"].dt.hour >= 7) & (model_df["charge_end_time"].dt.hour < 10))
+                | ((model_df["charge_end_time"].dt.hour >= 9) & (model_df["charge_end_time"].dt.hour < 18))
+            ).astype(int),
+            "weekend_flag": model_df["charge_end_time"].dt.weekday.isin([5, 6]).astype(int),
+        }
+        common_df = pd.DataFrame(common_features, index=model_df.index)
+        if not station_features.empty:
+            common_df = pd.concat([common_df, station_features], axis=1)
+        return common_df
+
     def build_features(self) -> HashvinResult:
+        """
+        要件§2〜§7の流れに沿って学習用特徴テーブルを構築し、HashvinResultを返す。
+
+        フロー:
+          1. 教師対象抽出と時系列Split（§1, §2）
+          2. HEADクラスタ決定と辞書作成（§3, §4）
+          3. 特徴量生成（共通＋クラス依存）とラベル整形（§4, §5）
+          4. train/valid/testセットをまとめて返却（§6, §7準備）
+        """
         model_df = self._select_model_rows()
         if model_df.empty:
             return HashvinResult(
@@ -405,7 +531,7 @@ class HashvinProcessor:
                 label_col="y_class",
             )
 
-        model_df["split"] = assign_splits(len(model_df))
+        model_df["split"] = assign_splits(len(model_df))  # §2: 時系列Split（train/valid/test）
         head_clusters, head_details = self._select_head_clusters(model_df[model_df["split"] == "train"])
 
         if not head_clusters:
@@ -440,87 +566,20 @@ class HashvinProcessor:
             matrix = p_start.get(info.cluster_id)
             info.p_start_matrix = matrix.tolist() if matrix is not None else []
 
-        # Initialize history state
-        freq_state = {cid: self.config.laplace_alpha for cid in head_clusters}
-        last_visit_state = {cid: None for cid in head_clusters}
-
-        feature_records: Dict[str, List[float]] = {}
-        distance_cache: Dict[str, float] = {}
-
-        # Precompute one-hot optional features
+        # クラス依存特徴（距離/頻度/Recency/time_compat）を生成（§4.2）
         station_features = self._station_type_feature(model_df)
+        class_feature_df = self._generate_class_feature_frame(model_df, head_clusters, centroids, delays, p_start)
+        # 共通特徴を結合（§4.1）
+        common_df = self._generate_common_features(model_df, station_features)
 
-        for cid in head_clusters:
-            feature_records[f"dist_to_{cid}"] = []
-            feature_records[f"freq_hashvin_{cid}"] = []
-            feature_records[f"recency_{cid}_h"] = []
-            feature_records[f"time_compat_{cid}"] = []
+        feature_df = pd.concat([model_df, common_df, class_feature_df], axis=1)
 
-        # Iterate chronologically
-        for _, row in model_df.iterrows():
-            charge_lat = row.get("charge_lat")
-            charge_lon = row.get("charge_lon")
-            charge_end_time: Timestamp = row["charge_end_time"]
-
-            for cid in head_clusters:
-                centroid_lat, centroid_lon = centroids.get(cid, (None, None))
-                cache_key = f"{cid}_{row.name}"
-                if centroid_lat is None or centroid_lon is None or pd.isna(charge_lat) or pd.isna(charge_lon):
-                    distance = float("nan")
-                else:
-                    distance = haversine_km(charge_lat, charge_lon, centroid_lat, centroid_lon)
-                distance_cache[cache_key] = distance
-                feature_records[f"dist_to_{cid}"].append(log1p_safe(distance) if not math.isnan(distance) else float("nan"))
-                feature_records[f"freq_hashvin_{cid}"].append(freq_state.get(cid, self.config.laplace_alpha))
-                last_visit = last_visit_state.get(cid)
-                if last_visit is None:
-                    recency = self.config.recency_default_hours
-                else:
-                    delta = (charge_end_time - last_visit).total_seconds() / 3600.0
-                    recency = float(max(delta, 0.0))
-                feature_records[f"recency_{cid}_h"].append(recency)
-                matrix = p_start.get(cid)
-                delay = delays.get(cid, 0.0)
-                feature_records[f"time_compat_{cid}"].append(self._time_compat_score(row, matrix, delay))
-
-            # Update states if within train split
-            if row["split"] == "train":
-                target = row["next_long_inactive_cluster"]
-                if target in head_clusters:
-                    freq_state[target] = freq_state.get(target, self.config.laplace_alpha) + 1.0
-                    last_visit_state[target] = row["inactive_start_time"]
-
-        # Common features ------------------------------------------------------
-        dow = model_df["charge_end_time"].dt.weekday
-        hour = model_df["charge_end_time"].dt.hour + model_df["charge_end_time"].dt.minute / 60.0
-        hour_rad = 2 * math.pi * hour / 24.0
-
-        common_features = {
-            "dow": dow,
-            "hour_sin": np.sin(hour_rad),
-            "hour_cos": np.cos(hour_rad),
-            "charge_durations_minutes": model_df.get("charge_durations_minutes"),
-            "soc_start": model_df.get("charge_start_soc"),
-            "soc_end": model_df.get("charge_end_soc"),
-            "soc_delta": model_df.get("charge_end_soc") - model_df.get("charge_start_soc"),
-            "is_return_band": ((model_df["charge_end_time"].dt.hour >= 18) | (model_df["charge_end_time"].dt.hour < 6)).astype(int),
-            "is_commute_band": (
-                ((model_df["charge_end_time"].dt.hour >= 7) & (model_df["charge_end_time"].dt.hour < 10))
-                | ((model_df["charge_end_time"].dt.hour >= 9) & (model_df["charge_end_time"].dt.hour < 18))
-            ).astype(int),
-            "weekend_flag": model_df["charge_end_time"].dt.weekday.isin([5, 6]).astype(int),
-        }
-        common_df = pd.DataFrame(common_features, index=model_df.index)
-        if not station_features.empty:
-            common_df = pd.concat([common_df, station_features], axis=1)
-
-        feature_df = pd.concat([model_df, common_df, pd.DataFrame(feature_records, index=model_df.index)], axis=1)
-
-        # Assign label with OTHER mapping
+        # §3: HEAD外はOTHERにマージして教師を整形
         feature_df["y_class"] = feature_df["next_long_inactive_cluster"].where(
             feature_df["next_long_inactive_cluster"].isin(head_clusters), OTHER_LABEL
         )
 
+        # §6: 学習/検証/テスト用に分割テーブルを用意
         split_datasets = {
             split: feature_df[feature_df["split"] == split].copy() for split in ["train", "valid", "test"]
         }
@@ -536,5 +595,6 @@ class HashvinProcessor:
 
 
 def save_head_details(head_details: Sequence[HeadClusterInfo], output_path: Path) -> None:
+    """HEAD抽出結果をJSONに保存（§3, §8の検証・運用で再利用）。"""
     data = [info.to_dict() for info in head_details]
     output_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
