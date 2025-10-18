@@ -18,23 +18,19 @@ from sklearn.metrics import accuracy_score, confusion_matrix
 from .pipeline import HashvinResult, save_head_details
 
 
-def _select_feature_columns(df: pd.DataFrame, enable_station_type: bool) -> List[str]:
-    """パイプラインで生成した列のうち、学習に投入する対象を整理（§4, §6）。"""
-    base_cols = [
-        "dow",
-        "hour_sin",
-        "hour_cos",
-        "charge_durations_minutes",
-        "soc_start",
-        "soc_end",
-        "soc_delta",
-        "is_return_band",
-        "is_commute_band",
-        "weekend_flag",
+def _select_feature_columns(df: pd.DataFrame, include_station: Optional[bool]) -> List[str]:
+    """学習に使用する安全な列のみを抽出する（§4, §6）。"""
+    core_cols = [col for col in ["dow", "hour_sin", "hour_cos", "soc_start"] if col in df.columns]
+    behavior_cols = [
+        col for col in ["is_return_band", "is_commute_band", "weekend_flag"] if col in df.columns
     ]
-    if enable_station_type:
-        station_cols = [col for col in df.columns if col.startswith("station_")]
-        base_cols.extend(station_cols)
+    station_cols = [col for col in df.columns if col.startswith("station_")]
+
+    if include_station is None:
+        include_station = bool(station_cols)
+    if not include_station:
+        station_cols = []
+
     cluster_cols = [
         col
         for col in df.columns
@@ -43,7 +39,7 @@ def _select_feature_columns(df: pd.DataFrame, enable_station_type: bool) -> List
         or col.startswith("recency_")
         or col.startswith("time_compat_")
     ]
-    return [col for col in base_cols + cluster_cols if col in df.columns]
+    return core_cols + behavior_cols + station_cols + cluster_cols
 
 
 def _prepare_training_frame(df: pd.DataFrame, feature_cols: List[str], label: str) -> pd.DataFrame:
@@ -125,7 +121,7 @@ def _save_predictions(
 def train_and_evaluate(
     result: HashvinResult,
     output_dir: Path,
-    enable_station_type: bool = False,
+    enable_station_type: Optional[bool] = None,
     autogluon_presets: str = "medium_quality_faster_train",
     autogluon_time_limit: Optional[int] = None,
     eval_thresholds: Iterable[float] = (0.5, 0.7, 0.9),
@@ -152,7 +148,7 @@ def train_and_evaluate(
     if not feature_cols:
         raise ValueError("No feature columns selected. Check feature generation.")
 
-    # AutoGluonに渡すため train/valid/test を必要な列のみ抽出
+    # train/valid/test をAutoGluonに渡せる形式に整形
     train_model_df = _prepare_training_frame(train_df, feature_cols, label_col)
     valid_model_df = _prepare_training_frame(valid_df, feature_cols, label_col) if not valid_df.empty else None
     test_model_df = _prepare_training_frame(test_df, feature_cols, label_col) if not test_df.empty else None
