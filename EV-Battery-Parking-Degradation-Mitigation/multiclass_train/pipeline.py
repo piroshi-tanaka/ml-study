@@ -166,7 +166,7 @@ class PipelineConfig:
     frequency_window_days: float = 90.0
     day_time_bin_hours: int = 6  # 当日行動ヒストグラムのビン幅
     day_time_window_hours: int = 24  # rollingモードのウィンドウ長
-    day_time_window_mode: str = "rolling"  # 'rolling' or 'calendar'
+    day_time_window_mode: str = "calendar"  # 'rolling' or 'calendar'
     feature_toggles: FeatureToggleConfig = field(default_factory=FeatureToggleConfig)
 
     @property
