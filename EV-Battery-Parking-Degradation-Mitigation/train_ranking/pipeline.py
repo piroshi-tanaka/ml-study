@@ -267,8 +267,9 @@ class PipelineConfig:
         遅延時間の上限（時間）。異常値を除外し計算の安定性を確保。
 
     frequency_window_days : float, default=90.0
-        頻度カウントで参照する固定ウィンドウ日数（日）。
-        ※現在は使用していない可能性あり（適応ウィンドウが優先）。
+        頻度カウントで参照するウィンドウ日数（日）。
+        ※現在は非推奨。候補生成時の適応ウィンドウ（candidate_window_alpha × 充電間隔中央値）を
+        頻度・recency・遷移確率などの特徴量計算期間として統一使用することを推奨。
 
     day_time_bin_hours : int, default=6
         当日行動ヒストグラム（daily_bin_*）のビン幅（時間）。
@@ -819,10 +820,24 @@ class CandidateFeatureAssembler:
         self.toggles = config.feature_toggles
 
     def _distance_to_candidate(self, row: pd.Series, cluster_id: str) -> float:
+        """充電地点から候補クラスタまでの距離を計算する。
+        
+        Parameters
+        ----------
+        row : pd.Series
+            充電セッション情報
+        cluster_id : str
+            候補クラスタID
+        
+        Returns
+        -------
+        float
+            距離（メートル）。欠損がある場合はNaN。
+        """
         if not self.toggles.use_distance:
             return 0.0
-        charge_lat = row.get("charge_lat")
-        charge_lon = row.get("charge_lon")
+        charge_lat = row.get("charging_start_lat")
+        charge_lon = row.get("charging_start_lon")
         if pd.isna(charge_lat) or pd.isna(charge_lon):
             return float("nan")
         centroid_lat, centroid_lon = self.centroids.get(cluster_id, (None, None))
@@ -831,6 +846,22 @@ class CandidateFeatureAssembler:
         return round(haversine_meters(charge_lat, charge_lon, centroid_lat, centroid_lon), 0)
 
     def _resolve_delay(self, origin_cluster: Optional[str], target_cluster: str) -> float:
+        """充電クラスタから放置クラスタへの遅延時間を取得する。
+        
+        ペア遅延が利用可能ならそれを優先し、なければクラスタ単体の遅延を返す。
+        
+        Parameters
+        ----------
+        origin_cluster : Optional[str]
+            充電クラスタID
+        target_cluster : str
+            放置クラスタID
+        
+        Returns
+        -------
+        float
+            遅延時間（時間）
+        """
         if origin_cluster is not None:
             key = (origin_cluster, target_cluster)
             if key in self.pair_delays:
@@ -843,6 +874,22 @@ class CandidateFeatureAssembler:
         matrix: Optional[np.ndarray],
         delay_hours: float,
     ) -> float:
+        """指定時刻＋遅延後の曜日×時間ビンにおける開始確率を取得する。
+        
+        Parameters
+        ----------
+        charge_start : Timestamp
+            充電開始時刻
+        matrix : Optional[np.ndarray]
+            曜日×時間ビンの確率行列（7×bins_per_day）
+        delay_hours : float
+            遅延時間（時間）
+        
+        Returns
+        -------
+        float
+            開始確率
+        """
         if matrix is None or matrix.size == 0:
             return 0.0
         if getattr(charge_start, "tzinfo", None) is None:
@@ -861,6 +908,23 @@ class CandidateFeatureAssembler:
         row: pd.Series,
         cluster_id: str,
     ) -> float:
+        """時間相性スコアを計算する。
+        
+        充電開始時刻＋遅延時間から予測される放置開始時刻が、
+        候補クラスタの典型的な開始時刻とどの程度一致するかを評価。
+        
+        Parameters
+        ----------
+        row : pd.Series
+            充電セッション情報
+        cluster_id : str
+            候補クラスタID
+        
+        Returns
+        -------
+        float
+            時間相性スコア（0〜1の確率値）
+        """
         if not self.toggles.use_time_compat:
             return 0.0
         charge_start = row.get("charge_start_time")
@@ -873,6 +937,22 @@ class CandidateFeatureAssembler:
         return self._calc_time_kernel(charge_start, matrix, delay)
 
     def _transition_score(self, row: pd.Series, candidate_cluster: str) -> float:
+        """前回の長時間放置クラスタから候補クラスタへの遷移確率を取得する。
+        
+        充電開始時刻の曜日×時間帯を考慮した遷移確率を返す。
+        
+        Parameters
+        ----------
+        row : pd.Series
+            充電セッション情報
+        candidate_cluster : str
+            候補クラスタID
+        
+        Returns
+        -------
+        float
+            遷移確率（0〜1）
+        """
         if not self.toggles.use_prev_transition:
             return 0.0
         prev_cluster_raw = row.get("prev_long_inactive_cluster")
@@ -910,19 +990,49 @@ class CandidateFeatureAssembler:
         return float(prob if prob is not None else 0.0)
 
     def build_feature_dict(self, row: pd.Series, candidate: CandidateInfo) -> Dict[str, object]:
-        """候補クラスタ1件分の特徴量を辞書形式で返す。"""
+        """候補クラスタ1件分の特徴量を辞書形式で返す。
+        
+        【重要】頻度・recency・ウィンドウ日数は候補生成時の適応ウィンドウを使用。
+        これにより、充電間隔に応じたデータ取得期間が特徴量計算にも統一的に適用される。
+        
+        Parameters
+        ----------
+        row : pd.Series
+            充電セッション情報
+        candidate : CandidateInfo
+            候補クラスタ情報（適応ウィンドウ内の統計を含む）
+        
+        Returns
+        -------
+        Dict[str, object]
+            候補依存特徴量の辞書
+        """
         features: Dict[str, object] = {}
+        # 距離特徴: 充電地点から候補クラスタまでの物理的距離（メートル）
         features["cand_distance_m"] = self._distance_to_candidate(row, candidate.cluster_id)
+        
+        # 頻度特徴: 適応ウィンドウ内での訪問回数（ラプラス平滑あり）
         features["cand_freq_in_window"] = candidate.freq_in_window + self.config.laplace_alpha
         features["cand_freq_log"] = log1p_safe(candidate.freq_in_window)
+        
+        # Recency特徴: 最後に訪問してからの経過時間（時間）
         features["cand_recency_hours"] = candidate.recency_hours
+        
+        # ウィンドウ情報: 適応ウィンドウの日数と総イベント数
         features["cand_window_days"] = candidate.window_days
         features["cand_events_in_window"] = candidate.events_in_window
+        
+        # 候補メタ情報
         features["cand_source"] = candidate.source
         features["cand_in_window"] = int(candidate.in_window)
         features["cand_distance_order"] = candidate.distance_order if candidate.distance_order is not None else -1
+        
+        # 時間相性: 充電時刻+遅延から予測される放置開始時刻の確率
         features["cand_time_compat"] = self._time_compat_score(row, candidate.cluster_id)
+        
+        # 遷移確率: 前回の放置クラスタから候補クラスタへの遷移確率
         features["cand_transition_prev"] = self._transition_score(row, candidate.cluster_id)
+        
         return features
 
 
@@ -941,7 +1051,27 @@ class VisitStatisticsBuilder:
         Dict[str, np.ndarray],
         Dict[str, Dict[object, Dict[str, float]]],
     ]:
-        """重心・遅延・時間分布・遷移確率をまとめて計算し、後続の特徴量生成に渡す。"""
+        """重心・遅延・時間分布・遷移確率をまとめて計算し、後続の特徴量生成に渡す。
+        
+        【重要】これらの統計は学習データ全体から作成される固定辞書。
+        valid/testデータでは更新せず、リーク防止のため学習時の統計をそのまま使用。
+        
+        一方、候補生成時の頻度・recencyは予測時点までの履歴で動的に更新される。
+        これにより、「統計的な傾向（固定）」と「個別の最新状況（可変）」を両立。
+        
+        Returns
+        -------
+        centroids : Dict[str, Tuple[Optional[float], Optional[float]]]
+            クラスタID→(緯度, 経度)の辞書
+        cluster_delays : Dict[str, float]
+            クラスタID→遅延時間（時間）の辞書
+        pair_delays : Dict[Tuple[str, str], float]
+            (充電クラスタ, 放置クラスタ)→遅延時間の辞書
+        p_start : Dict[str, np.ndarray]
+            クラスタID→曜日×時間ビンの開始確率行列（7×bins_per_day）
+        transitions : Dict[str, Dict[object, Dict[str, float]]]
+            前回クラスタ→曜日×時間ビン→次クラスタの遷移確率辞書
+        """
         if not train_clusters:
             return {}, {}, {}, {}, {}
         train_cutoff = train_df["charge_start_time"].max()
@@ -1166,9 +1296,8 @@ class CommonFeatureAssembler:
         """
         charge_start = model_df["charge_start_time"]
 
-        # タイムゾーン付きのままではモデルが扱いづらいので、一旦JSTへそろえた上でtz情報を外す。
-        charge_start_local = charge_start.dt.tz_convert("Asia/Tokyo") if getattr(charge_start.dt, "tz", None) else charge_start
-        charge_start_naive = charge_start_local.dt.tz_localize(None)
+        # JSTタイムゾーン付きのまま処理（タイムゾーン情報を保持）
+        charge_start_jst = charge_start.dt.tz_convert("Asia/Tokyo") if getattr(charge_start.dt, "tz", None) else charge_start
 
         columns: Dict[str, pd.Series] = {}
 
@@ -1178,26 +1307,26 @@ class CommonFeatureAssembler:
         include_raw = mode in {"datetime", "raw", "all"}
         include_categorical = mode in {"categorical", "all"}
 
-        hour_fraction = charge_start_naive.dt.hour + charge_start_naive.dt.minute / 60.0
+        hour_fraction = charge_start_jst.dt.hour + charge_start_jst.dt.minute / 60.0
         hour_radian = 2 * math.pi * hour_fraction / 24.0
 
         if include_cyclic:
             # sin/cos で24時間周期を滑らかに表現。dowは曜日の整数インデックス（0=月〜6=日）。
-            columns["dow"] = charge_start_naive.dt.weekday
+            columns["dow"] = charge_start_jst.dt.weekday
             columns["hour_sin"] = np.sin(hour_radian)
             columns["hour_cos"] = np.cos(hour_radian)
 
         if include_raw:
-            # AutoGluonはdatetime型も扱えるため、生の時刻とUNIX秒をあわせて渡せるようにする。
-            columns["time_raw_charge_start"] = charge_start_naive
-            # view で得られるUNIXナノ秒値を秒に換算し、NaT部分はmaskでNaNへ変換する。
-            timestamp_series = charge_start_naive.view("int64").astype(float) / 1_000_000_000
-            timestamp_series = timestamp_series.mask(charge_start_naive.isna(), np.nan)
+            # AutoGluonはdatetime型も扱えるため、生の時刻（JSTタイムゾーン付き）とUNIX秒を渡す。
+            columns["time_raw_charge_start"] = charge_start_jst
+            # UNIXタイムスタンプ（秒）を計算。NaT部分はNaNへ変換。
+            timestamp_series = charge_start_jst.astype("int64") / 1_000_000_000
+            timestamp_series = timestamp_series.mask(charge_start_jst.isna(), np.nan)
             columns["time_raw_timestamp"] = timestamp_series
 
         if include_categorical:
             # 2時間幅のカテゴリ（00_02, 02_04, ...）と曜日カテゴリを作成し、決定木系モデルで扱いやすくする。
-            hour_value = charge_start_naive.dt.hour.astype("float")
+            hour_value = charge_start_jst.dt.hour.astype("float")
             band_start = (hour_value // 2) * 2
             band_labels = band_start.map(
                 lambda h: "unknown" if np.isnan(h) else f"{int(h):02d}_{int((h + 2) % 24):02d}"
@@ -1205,7 +1334,7 @@ class CommonFeatureAssembler:
             categories = [f"{i:02d}_{(i + 2) % 24:02d}" for i in range(0, 24, 2)]
             columns["time_band_2h"] = pd.Categorical(band_labels, categories=categories + ["unknown"], ordered=False)
 
-            dow_labels = charge_start_naive.dt.weekday.map({0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"})
+            dow_labels = charge_start_jst.dt.weekday.map({0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"})
             dow_labels = dow_labels.fillna("unknown")
             columns["time_dow_category"] = pd.Categorical(
                 dow_labels, categories=["mon", "tue", "wed", "thu", "fri", "sat", "sun", "unknown"], ordered=False
@@ -1393,6 +1522,7 @@ class HashvinProcessor:
 
     def build_features(self) -> HashvinResult:
         """候補生成＋二値スコアリング用テーブルを構築する。"""
+        # ステップ1: 教師データ対象行の抽出と時系列整列
         model_df = self._select_model_rows()
         if model_df.empty:
             empty = {split: model_df.copy() for split in ["train", "valid", "test"]}
@@ -1403,22 +1533,31 @@ class HashvinProcessor:
                 label_col="label",
             )
 
+        # ステップ2: train/valid/test分割（時系列順0.7/0.1/0.2）
         model_df["split"] = assign_splits(len(model_df))
+        
+        # ステップ3: 当日行動ヒストグラム特徴の追加
         model_df = self._add_daily_time_bins(model_df)
 
+        # ステップ4: 学習データからクラスタ一覧と充電間隔中央値を算出
         train_df = model_df[model_df["split"] == "train"].copy()
         train_clusters = sorted(train_df["next_long_inactive_cluster"].dropna().astype(str).unique().tolist())
         base_window_days = compute_charge_interval_median(train_df, self.config.default_charge_interval_days)
 
+        # ステップ5: クラスタ統計の構築（重心・遅延・時間分布・遷移確率）
+        # これらの統計は学習データのみから作成し、valid/testでは更新しない（リーク防止）
         stats_builder = VisitStatisticsBuilder(self.config, self.sessions_df)
         centroids, cluster_delays, pair_delays, p_start, transitions = stats_builder.build(
             train_df, train_clusters
         )
 
+        # ステップ6: 候補生成器と特徴量アセンブラの初期化
+        # 候補履歴: 予測時点までの放置実績を時系列で蓄積
         candidate_history = CandidateHistory(
             default_recency_hours=self.config.recency_default_hours,
             recent_limit=self.config.candidate_recent_charge_count,
         )
+        # 候補生成器: 適応ウィンドウ+距離+日常的長時間滞在から候補を動的生成
         candidate_generator = CandidateGenerator(
             config=self.config,
             centroids=centroids,
@@ -1427,6 +1566,7 @@ class HashvinProcessor:
             sessions_df=self.sessions_df,
             train_cutoff=train_df["charge_start_time"].max() if not train_df.empty else None,
         )
+        # 候補特徴アセンブラ: 候補クラスタごとの特徴量（距離・頻度・時間相性など）を計算
         candidate_feature = CandidateFeatureAssembler(
             config=self.config,
             centroids=centroids,
@@ -1436,21 +1576,26 @@ class HashvinProcessor:
             transitions=transitions,
         )
 
+        # ステップ7: 共通特徴量の生成（時刻・SOCなどクラスタ非依存特徴）
         common_assembler = CommonFeatureAssembler(self.config)
         common_features = common_assembler.transform(model_df)
         base_df = pd.concat([model_df, common_features], axis=1)
         if base_df.columns.duplicated().any():
             base_df = base_df.loc[:, ~base_df.columns.duplicated()]
 
+        # ステップ8: 候補×セッション行の生成（二値スコアリング用データ作成）
         records: List[Dict[str, object]] = []
         ordered_indices = base_df.sort_values("charge_start_time").index.tolist()
         for idx in ordered_indices:
             row = base_df.loc[idx]
             true_cluster = row.get("next_long_inactive_cluster")
+            
+            # 充電セッションごとに候補クラスタを動的生成
             candidates, _, events_in_window = candidate_generator.generate_candidates(
                 row, candidate_history, true_cluster
             )
 
+            # 各候補クラスタについて1行ずつ特徴量を作成
             for candidate in candidates:
                 feature_row = row.to_dict()
                 feature_row.update(candidate_feature.build_feature_dict(row, candidate))
@@ -1461,6 +1606,7 @@ class HashvinProcessor:
                 feature_row["cand_window_total_events"] = events_in_window
                 records.append(feature_row)
 
+            # 学習データのみ履歴に登録（valid/testは予測のみで履歴更新しない）
             candidate_history.register_event(
                 cluster_id=true_cluster,
                 charge_end_time=row.get("charge_end_time"),
