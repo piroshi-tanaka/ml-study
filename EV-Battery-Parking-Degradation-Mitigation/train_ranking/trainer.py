@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -8,7 +8,7 @@ import pandas as pd
 from autogluon.tabular import TabularPredictor
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 
-from .pipeline import HashvinResult, save_head_details
+from .pipeline import HashvinResult
 
 
 def _select_feature_columns(df: pd.DataFrame, include_station: Optional[bool]) -> List[str]:
@@ -211,7 +211,6 @@ def train_and_evaluate(
     """AutoGluonで候補スコアリングモデルを学習し、評価指標を保存する。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     _save_split_tables(result, output_dir)
-    save_head_details(result.head_details, output_dir / "head_clusters.json")
 
     label_col = result.label_col
     train_df = result.split_datasets.get("train", pd.DataFrame())

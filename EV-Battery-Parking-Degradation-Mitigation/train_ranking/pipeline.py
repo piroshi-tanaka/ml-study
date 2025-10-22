@@ -1,27 +1,25 @@
 
 """EV長時間放置クラスタ予測の前処理パイプライン。
 
-要件.md のMVP＋α要件（§0〜§8）に対応する補助クラスと関数を提供する。
-- §0〜§2: hashvin単位の独立処理・時系列Split
-- §3: HEADクラスタ抽出（K≤10制限＋OTHER統合）
-- §4: 特徴量生成（MVP4本＋αを切り替え可能）
-- §5〜§7: 学習テーブル整形と辞書出力
+train_ranking要件.mdに基づき、候補生成＋二値スコアリング方式で放置場所を予測する。
+- hashvin単位の独立処理・時系列Split
+- 適応ウィンドウによる候補生成（充電間隔に応じた動的ウィンドウ）
+- 候補依存特徴量と共通特徴量の生成
+- 二値スコアリング用の学習テーブル構築
 """
 from __future__ import annotations
 
-import json
 import math
 from bisect import bisect_left
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from pandas import Timestamp
 
-OTHER_LABEL = "OTHER"  # §3 HEAD外統合クラス
+OTHER_LABEL = "OTHER"
 GLOBAL_TRANS_KEY = "__GLOBAL__"
 DEFAULT_BIN_KEY = "__DEFAULT__"
 
@@ -32,7 +30,7 @@ def ensure_datetime(series: pd.Series) -> pd.Series:
     Parameters
     ----------
     series : pd.Series
-        日時情報を含む列。文字列・object型でも受け取り、すべてをJSTにそろえる。
+        日時情報を含む列。**入力データはJSTタイムゾーン付きが前提**。
 
     Returns
     -------
@@ -41,31 +39,43 @@ def ensure_datetime(series: pd.Series) -> pd.Series:
 
     Notes
     -----
-    下流の処理（時系列ソートやリーク防止チェック）はタイムゾーン付きdatetimeを前提にしているため、
-    入力データが文字列・タイムゾーンなしのdatetimeであってもここで必ず統一しておく。
+    入力データは既にJSTタイムゾーン付きであることを前提としているが、
+    万が一タイムゾーンが欠けている場合はJSTとして解釈する。
+    下流の処理（時系列ソートやリーク防止チェック）はタイムゾーン付きdatetimeを前提にしている。
     """
-    #  セッションCSVがtz無しのUTC相当で届くことがあるため、ここで必ずJSTに固定する。
-    # 充電終了時刻を扱う後段ロジックが「タイムゾーン付き」を前提にしている点にも注意。
     if pd.api.types.is_datetime64_any_dtype(series):
         if getattr(series.dt, "tz", None) is None:
+            # タイムゾーンが欠けている場合はJSTとして解釈
             return series.dt.tz_localize("Asia/Tokyo")
         return series
     parsed = pd.to_datetime(series, errors="coerce")
     if getattr(parsed.dt, "tz", None) is None:
+        # タイムゾーンが欠けている場合はJSTとして解釈
         return parsed.dt.tz_localize("Asia/Tokyo")
     return parsed
 
 
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """地球上の2地点間距離をハバーサイン公式で計算する。
+def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """地球上の2地点間距離をハバーサイン公式で計算する（メートル単位）。
 
     距離特徴はモデルの中核なので、緯度経度が欠損している場合は NaN を返し、
     後段で適切に欠損処理できるようにしている。
+
+    Parameters
+    ----------
+    lat1, lon1 : float
+        始点の緯度・経度
+    lat2, lon2 : float
+        終点の緯度・経度
+
+    Returns
+    -------
+    float
+        2地点間の距離（メートル）。欠損がある場合はNaN。
     """
-    #  単純なユークリッド距離だと地球曲率で誤差が出るので、EVの実移動距離感覚に合うハバーサインを採用。
     if any(pd.isna([lat1, lon1, lat2, lon2])):
         return float("nan")
-    r = 6371.0
+    r = 6371000.0  # 地球の半径（メートル）
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     d_phi = math.radians(lat2 - lat1)
@@ -82,7 +92,7 @@ def latlon_delta_to_meters(lat1: float, lon1: float, lat2: float, lon2: float) -
     avg_lat = (lat1 + lat2) / 2.0
     meters_lat = (lat2 - lat1) * 111_320.0
     meters_lon = (lon2 - lon1) * (40075000.0 * math.cos(math.radians(avg_lat)) / 360.0)
-    distance_m = haversine_km(lat1, lon1, lat2, lon2) * 1000.0
+    distance_m = haversine_meters(lat1, lon1, lat2, lon2)
     return meters_lat, meters_lon, distance_m
 
 
@@ -98,22 +108,48 @@ def log1p_safe(value: float) -> float:
     return math.log1p(value)
 
 
-def compute_charge_interval_median(train_df: pd.DataFrame) -> float:
+def compute_charge_interval_median(train_df: pd.DataFrame, default_days: float = 14.0) -> float:
     """充電開始時刻の間隔中央値（日数）を求め、候補生成用ウィンドウの基準値とする。
-
-    学習データが乏しい場合は14日を既定値とし、NaTが混在しても安全に処理する。
+    
+    この関数は、hashvinごとの充電習慣（充電間隔）を定量化し、候補生成ウィンドウの基準値を決定する。
+    
+    【活用箇所】
+    1. 候補生成時の適応ウィンドウ幅の算出（CandidateGenerator._compute_window_days）
+       - 充電間隔が短い人（例：3日ごと）→ウィンドウを短く（直近の最新傾向を重視）
+       - 充電間隔が長い人（例：20日ごと）→ウィンドウを長く（十分なデータ量を確保）
+    
+    2. 放置回数・頻度特徴の集計期間
+       - 短い間隔で充電する人は直近の短期間データから習慣を把握
+       - 長い間隔の人は長期間のデータから習慣を抽出
+    
+    【ロジック詳細】
+    - 充電開始時刻を時系列順に並べ、隣接する充電間の時間差を算出
+    - 中央値を採用することで外れ値（極端に長い/短い間隔）の影響を抑制
+    - データ不足時はdefault_days（既定14日）を返す
+    
+    Parameters
+    ----------
+    train_df : pd.DataFrame
+        学習用の充電データ。charge_start_time列を含む。
+    default_days : float
+        充電間隔が算出できない場合の既定値（日数）。
+    
+    Returns
+    -------
+    float
+        充電間隔の中央値（日数）。算出不可時はdefault_daysを返す。
     """
     if train_df.empty or "charge_start_time" not in train_df.columns:
-        return 14.0
+        return default_days
     times = train_df["charge_start_time"].dropna().sort_values()
     if len(times) < 2:
-        return 14.0
+        return default_days
     deltas = times.diff().dropna()
     if deltas.empty:
-        return 14.0
+        return default_days
     median_days = float(deltas.median().total_seconds() / 86400.0)
     if not math.isfinite(median_days) or median_days <= 0:
-        return 14.0
+        return default_days
     return median_days
 
 
@@ -141,40 +177,152 @@ def assign_splits(n_rows: int, train_ratio: float = 0.7, valid_ratio: float = 0.
 
 @dataclass
 class FeatureToggleConfig:
-    """特徴量の切替と時刻表現を管理する設定をまとめたクラス。
+    """特徴量の切替と時刻表現を管理する設定クラス。
 
     各フラグは「この特徴量を使う／使わない」を明示し、実験時にON/OFFを切り替えやすくする。
-    時刻の扱いは time_feature_mode で一括指定し、Cyclic（sin/cos）、Datetime（生データ）、
-    Categorical（時間帯カテゴリ）、All（これら全て）から選択できる。
-    また、直前遷移（use_prev_transition）、移動ベクトル（use_prev_vector）、当日行動ヒストグラム（use_daily_time_bins）
-    の利用可否もここで制御する。
+
+    Attributes
+    ----------
+    use_distance : bool, default=True
+        候補クラスタまでの距離特徴（cand_distance_m）を使用するか。
+        充電地点から候補クラスタ重心までのハバーサイン距離（メートル）。
+        近接優位の物理的制約を反映する最重要特徴。
+
+    use_frequency : bool, default=True
+        候補クラスタへの訪問頻度特徴（cand_freq_in_window, cand_freq_log）を使用するか。
+        適応ウィンドウ内での訪問回数をカウント。個体の習慣の強さを表す。
+
+    use_recency : bool, default=True
+        候補クラスタへの最終訪問からの経過時間特徴（cand_recency_hours）を使用するか。
+        最後に訪問してからの時間（時間）。再訪周期を反映。
+
+    use_time_compat : bool, default=True
+        時間相性特徴（cand_time_compat）を使用するか。
+        曜日×時間帯の開始確率と遅延中央値から算出。HOME/WORKの時間習慣を反映。
+
+    use_station_type : bool, default=False
+        充電ステーション種別特徴（station_*）を使用するか。
+        200V/急速などのone-hot表現。充電の性質が次行動に与える影響を捉える。
+
+    use_prev_transition : bool, default=True
+        直前クラスタからの遷移確率特徴（cand_transition_prev）を使用するか。
+        前回の長時間放置クラスタから次クラスタへの遷移傾向を時間帯込みで捉える。
+
+    use_daily_time_bins : bool, default=True
+        当日（または直近時間）の時間帯別滞在クラスタ特徴（daily_bin_*）を使用するか。
+        充電前の行動パターン（どのクラスタで何分滞在したか）を時間帯別に記録。
+
+    time_feature_mode : str, default='cyclic'
+        時刻特徴の表現方法。以下から選択：
+        - 'cyclic': sin/cosで24時間周期を滑らかに表現（hour_sin, hour_cos, dow）
+        - 'datetime': 生の時刻とUNIXタイムスタンプ（time_raw_charge_start, time_raw_timestamp）
+        - 'categorical': 2時間幅のカテゴリと曜日カテゴリ（time_band_2h, time_dow_category）
+        - 'all': 上記すべてを含める
     """
 
     use_distance: bool = True
     use_frequency: bool = True
     use_recency: bool = True
     use_time_compat: bool = True
-    use_behavior_flags: bool = True
     use_station_type: bool = False
-    use_prev_transition: bool = True  # 直前クラスタ遷移確率を使う
-    use_prev_vector: bool = True  # 直前クラスタ→充電地点の移動ベクトルを使う
-    use_daily_time_bins: bool = True  # 当日（もしくは直近24h）の時間帯別クラスタ滞在を使う
-    time_feature_mode: str = "cyclic"  # 'cyclic' / 'datetime' / 'categorical' / 'all'
+    use_prev_transition: bool = True
+    use_daily_time_bins: bool = True
+    time_feature_mode: str = "cyclic"
 
 @dataclass
 class PipelineConfig:
     """パイプライン全体で共有するハイパーパラメータを保持する設定クラス。
 
-    - head_k: HEADとして採用するクラスタの最大件数。
-    - min_long_inactive_minutes: 「長時間放置」とみなす下限（分）。既定は6時間。
-    - laplace_alpha: 頻度特徴のラプラス平滑に使う初期値。
-    - frequency_window_days: 頻度カウントで参照する直近日数。
-    - day_time_bin_hours: 当日行動ヒストグラムのビン幅（例：6時間単位）。
-    - day_time_window_hours: rollingモードで何時間遡るか（例：24時間）。
-    - day_time_window_mode: 'rolling'（直近ウィンドウ） or 'calendar'（当日0:00〜充電時刻）を指定。
+    Attributes
+    ----------
+    min_long_inactive_minutes : int, default=360
+        「長時間放置」とみなす下限時間（分）。既定は360分（6時間）。
+        これ以上の滞在を「長時間放置」として予測対象とする。
+
+    laplace_alpha : float, default=1.0
+        頻度・遷移確率のラプラス平滑に使う初期カウント。
+        ゼロ頻度の候補でも最小限の確率を持たせることで未知クラスタへの過適合を防ぐ。
+
+    recency_default_hours : float, default=1e6
+        未訪問クラスタのRecency初期値（時間）。
+        一度も訪問したことがないクラスタは「非常に古い」として扱う。
+
+    time_bin_hours : int, default=4
+        時間相性（time_compat）と遷移確率で使う時間ビン幅（時間）。
+        24時間を何時間ごとに区切るか。既定4時間なら6ビン（0-4, 4-8, ...）。
+
+    station_type_map : Optional[Dict[str, str]], default=None
+        充電クラスタIDからステーション種別へのマッピング辞書。
+        例: {"C_0001": "200V", "C_0002": "急速"}
+
+    min_delay_samples : int, default=3
+        クラスタ単位の遅延中央値を採用する最小サンプル数。
+        これ未満の場合は全体中央値を使用。
+
+    min_pair_delay_samples : int, default=2
+        充電クラスタ×放置クラスタのペア遅延を採用する最小サンプル数。
+        これ未満の場合はクラスタ単体の遅延にフォールバック。
+
+    max_time_shift_hours : float, default=24.0
+        遅延時間の上限（時間）。異常値を除外し計算の安定性を確保。
+
+    frequency_window_days : float, default=90.0
+        頻度カウントで参照する固定ウィンドウ日数（日）。
+        ※現在は使用していない可能性あり（適応ウィンドウが優先）。
+
+    day_time_bin_hours : int, default=6
+        当日行動ヒストグラム（daily_bin_*）のビン幅（時間）。
+        例: 6時間なら4ビン（00-06, 06-12, 12-18, 18-24）。
+
+    day_time_window_hours : int, default=24
+        当日行動ヒストグラムをrollingモードで集計する際の遡り時間（時間）。
+
+    day_time_window_mode : str, default='calendar'
+        当日行動ヒストグラムの集計モード。
+        - 'rolling': 充電時刻からday_time_window_hours時間遡る
+        - 'calendar': 当日0:00から充電時刻まで
+
+    feature_toggles : FeatureToggleConfig
+        特徴量のON/OFF切り替え設定。
+
+    candidate_top_k : int, default=6
+        1セッションあたりの候補クラスタ数の上限。
+        計算量と学習安定性のバランスから5〜8が推奨。
+
+    candidate_min_unique : int, default=4
+        適応ウィンドウ内で最低限確保したいユニーククラスタ数。
+        これ未満の場合はウィンドウを拡張。
+
+    candidate_min_events : int, default=8
+        適応ウィンドウ内で最低限確保したい長時間放置イベント数。
+        これ未満の場合はウィンドウを拡張。
+
+    candidate_recent_charge_count : int, default=10
+        直近候補として参照する充電回数。
+        この回数分の直近充電で訪れたクラスタを候補に含める。
+
+    candidate_window_alpha : float, default=6.0
+        適応ウィンドウの基本倍率。
+        基本ウィンドウ日数 = 充電間隔中央値 × candidate_window_alpha。
+        例: 充電間隔3日 × 6.0 = 18日間。
+
+    candidate_min_days : int, default=7
+        適応ウィンドウの下限（日）。
+        これより短くならないよう制限。
+
+    candidate_max_days : int, default=56
+        適応ウィンドウの上限（日）。
+        これより長くならないよう制限。
+
+    candidate_expand_factor : float, default=1.5
+        ウィンドウ拡張時の倍率。
+        データ不足時、現在のウィンドウ日数にこの値を掛けて拡張。
+
+    default_charge_interval_days : float, default=14.0
+        充電間隔中央値が算出できない場合の既定値（日）。
+        データが少ない初期段階で使用。
     """
 
-    head_k: int = 10
     min_long_inactive_minutes: int = 360
     laplace_alpha: float = 1.0
     recency_default_hours: float = 1e6
@@ -184,9 +332,9 @@ class PipelineConfig:
     min_pair_delay_samples: int = 2
     max_time_shift_hours: float = 24.0
     frequency_window_days: float = 90.0
-    day_time_bin_hours: int = 6  # 当日行動ヒストグラムのビン幅
-    day_time_window_hours: int = 24  # rollingモードのウィンドウ長
-    day_time_window_mode: str = "calendar"  # 'rolling' or 'calendar'
+    day_time_bin_hours: int = 6
+    day_time_window_hours: int = 24
+    day_time_window_mode: str = "calendar"
     feature_toggles: FeatureToggleConfig = field(default_factory=FeatureToggleConfig)
     candidate_top_k: int = 6
     candidate_min_unique: int = 4
@@ -196,6 +344,7 @@ class PipelineConfig:
     candidate_min_days: int = 7
     candidate_max_days: int = 56
     candidate_expand_factor: float = 1.5
+    default_charge_interval_days: float = 14.0
 
     @property
     def enable_station_type(self) -> bool:
@@ -204,43 +353,10 @@ class PipelineConfig:
 
 
 @dataclass
-class HeadClusterInfo:
-    """HEADクラスタのメタ情報（§3 指標A〜D + §4辞書）を保持する。"""
-
-    cluster_id: str
-    source: str  # "after_charge" / "anytime"
-    count_after_charge: int = 0
-    hours_after_charge: float = 0.0
-    count_anytime: int = 0
-    hours_anytime: float = 0.0
-    centroid_lat: Optional[float] = None
-    centroid_lon: Optional[float] = None
-    delay_hours: float = 0.0
-    p_start_matrix: List[List[float]] = field(default_factory=list)
-
-    def to_dict(self) -> Dict[str, object]:
-        """JSON出力や記録用に、dataclassを辞書へ変換するヘルパー。"""
-        return {
-            "cluster_id": self.cluster_id,
-            "source": self.source,
-            "count_after_charge": self.count_after_charge,
-            "hours_after_charge": self.hours_after_charge,
-            "count_anytime": self.count_anytime,
-            "hours_anytime": self.hours_anytime,
-            "centroid_lat": self.centroid_lat,
-            "centroid_lon": self.centroid_lon,
-            "delay_hours": self.delay_hours,
-            "p_start_matrix": self.p_start_matrix,
-        }
-
-
-@dataclass
 class HashvinResult:
     """hashvin単位で特徴テーブルとメタ情報を束ねる結果オブジェクト。"""
 
     hashvin: str
-    head_clusters: List[str]
-    head_details: List[HeadClusterInfo]
     features: pd.DataFrame
     split_datasets: Dict[str, pd.DataFrame]
     label_col: str
@@ -348,7 +464,11 @@ class CandidateHistory:
 
 
 class CandidateGenerator:
-    """適応ウィンドウと履歴情報から候補クラスタ集合を構築する。"""
+    """適応ウィンドウと履歴情報から候補クラスタ集合を構築する。
+    
+    放置実績があるクラスタに加え、日常的に長時間滞在しているクラスタも候補に含める。
+    これにより、まだ充電後の放置実績はないが頻繁に訪れる場所も予測対象とする。
+    """
 
     def __init__(
         self,
@@ -356,10 +476,51 @@ class CandidateGenerator:
         centroids: Dict[str, Tuple[Optional[float], Optional[float]]],
         known_clusters: Sequence[str],
         base_window_days: float,
+        sessions_df: Optional[pd.DataFrame] = None,
+        train_cutoff: Optional[Timestamp] = None,
     ) -> None:
+        """
+        Parameters
+        ----------
+        config : PipelineConfig
+            パイプライン設定
+        centroids : Dict[str, Tuple[Optional[float], Optional[float]]]
+            クラスタID→(緯度, 経度)の辞書
+        known_clusters : Sequence[str]
+            trainで観測された放置クラスタのリスト
+        base_window_days : float
+            充電間隔中央値（適応ウィンドウの基準値）
+        sessions_df : Optional[pd.DataFrame]
+            全セッションデータ。日常的な長時間滞在クラスタの抽出に使用。
+        train_cutoff : Optional[Timestamp]
+            学習データの最終時刻。これより未来の情報はリーク防止のため除外。
+        """
         self.config = config
         self.centroids = centroids
-        self.known_clusters = list(dict.fromkeys(known_clusters))
+        
+        # 放置実績クラスタに加え、日常的に長時間滞在しているクラスタも候補プールに追加
+        frequent_long_stay_clusters: List[str] = []
+        if sessions_df is not None and not sessions_df.empty and train_cutoff is not None:
+            # 学習期間内の長時間inactiveセッションから頻出クラスタを抽出
+            long_stay_sessions = sessions_df[
+                (sessions_df["session_type"] == "inactive")
+                & (sessions_df["duration_minutes"] >= config.min_long_inactive_minutes)
+                & (sessions_df["start_time"] <= train_cutoff)
+            ]
+            if not long_stay_sessions.empty:
+                # ノイズクラスタ(-1)を除外し、頻度順で抽出
+                cluster_counts = long_stay_sessions[
+                    long_stay_sessions["session_cluster"] != "-1"
+                ]["session_cluster"].value_counts()
+                # 上位クラスタ（最大でcandidate_top_k × 3程度）を候補プールに追加
+                top_n = min(len(cluster_counts), config.candidate_top_k * 3)
+                frequent_long_stay_clusters = cluster_counts.head(top_n).index.astype(str).tolist()
+        
+        # 放置実績クラスタ + 日常的長時間滞在クラスタを統合（重複除去）
+        self.known_clusters = list(dict.fromkeys(
+            list(known_clusters) + frequent_long_stay_clusters
+        ))
+        
         self.base_window_days = float(base_window_days) if base_window_days and base_window_days > 0 else 14.0
 
     def _clip_days(self, days: float) -> float:
@@ -385,7 +546,7 @@ class CandidateGenerator:
         for cid, (clat, clon) in self.centroids.items():
             if clat is None or clon is None:
                 continue
-            dist_m = haversine_km(lat, lon, clat, clon) * 1000.0
+            dist_m = haversine_meters(lat, lon, clat, clon)
             candidates.append((dist_m, cid))
         candidates.sort(key=lambda item: item[0])
         return [cid for _, cid in candidates]
@@ -417,39 +578,112 @@ class CandidateGenerator:
         history: CandidateHistory,
         true_cluster: Optional[str],
     ) -> Tuple[List[CandidateInfo], float, int]:
-        """候補クラスタ一覧と採用したウィンドウ情報を返す。"""
+        """候補クラスタ一覧と採用したウィンドウ情報を返す。
+        
+        【候補生成の基本戦略】
+        このメソッドは、充電セッションごとに「次の長時間放置先として妥当な候補クラスタ集合」を動的に生成する。
+        候補生成は以下の3つの観点を組み合わせて行う：
+        
+        1. **履歴ベース（過去の放置実績）**
+           - この充電クラスタから放置した履歴があるクラスタを優先
+           - 利用回数が多いほど選ばれやすい（freq_in_window）
+        
+        2. **距離ベース（空間的近接性）**
+           - 充電地点から近いクラスタほど選ばれやすい
+           - 移動コストの観点から妥当な候補を補完
+        
+        3. **適応ウィンドウ（充電習慣への適応）**
+           - 充電間隔が短い人 → ウィンドウを短く（直近の最新傾向を重視）
+           - 充電間隔が長い人 → ウィンドウを長く（十分なデータ量を確保）
+           - データ不足時は自動的にウィンドウを拡張（candidate_expand_factor倍ずつ）
+        
+        【候補集合の構成（優先度順）】
+        1. ウィンドウ内候補（source="window"）：適応ウィンドウ内で実際に放置したクラスタ
+        2. 直近訪問候補（source="recent"）：直近N回の充電で訪れたクラスタ
+        3. 距離フォールバック候補（source="fallback"）：上記で不足する場合、距離順で補完
+        4. 真値候補（source="label"）：学習時のみ、正解クラスタを必ず含める
+        
+        【TOPKに満たない場合の補完ロジック】
+        - ウィンドウ内候補が少ない場合、自動的にウィンドウを拡張（最大candidate_max_daysまで）
+        - それでも不足する場合、距離順で既知クラスタから補完
+        - 最終的にcandidate_top_k件の候補を確保
+        
+        Parameters
+        ----------
+        row : pd.Series
+            充電セッション情報（charge_lat, charge_lon, charge_start_timeなどを含む）
+        history : CandidateHistory
+            これまでの放置履歴を保持するオブジェクト
+        true_cluster : Optional[str]
+            学習時の正解クラスタID（推論時はNone）
+        
+        Returns
+        -------
+        Tuple[List[CandidateInfo], float, int]
+            - 候補クラスタ情報のリスト（最大candidate_top_k件）
+            - 採用したウィンドウ日数
+            - ウィンドウ内の総イベント数
+        """
         reference_time = self._reference_time(row)
         window_start: Optional[Timestamp]
 
+        # ========================================
+        # ステップ1: 適応ウィンドウの決定
+        # ========================================
+        # 充電間隔に応じてウィンドウ幅を調整する。
+        # - 基本ウィンドウ = base_window_days（充電間隔中央値） × candidate_window_alpha（既定6倍）
+        # - 最小限のデータ量を確保するため、不足時は自動拡張（candidate_expand_factor倍ずつ）
+        # - 上限はcandidate_max_days（既定56日）、下限はcandidate_min_days（既定7日）
+        
         if reference_time is None or reference_time is pd.NaT:
+            # 時刻情報がない場合は最大ウィンドウを使用
             window_days = self.config.candidate_max_days
             window_start = None
         else:
             factor = 1.0
             while True:
+                # 充電間隔の中央値に基づいてウィンドウ幅を計算
+                # 例: 充電間隔が3日 → 基本ウィンドウ = 3日 × 6 = 18日
+                #     充電間隔が20日 → 基本ウィンドウ = 20日 × 6 = 120日 → 上限56日に制限
                 window_days = self._compute_window_days(factor)
                 window_start = reference_time - pd.Timedelta(days=window_days)
-                clusters = history.clusters_in_window(window_start)
-                events = history.total_events_in_window(window_start)
+                
+                # ウィンドウ内の統計を取得
+                clusters = history.clusters_in_window(window_start)  # ウィンドウ内で訪れたクラスタ
+                events = history.total_events_in_window(window_start)  # ウィンドウ内の総放置回数
+                
+                # 終了条件:
+                # 1. 十分なクラスタ数（candidate_min_unique以上、既定4個）
+                # 2. 十分なイベント数（candidate_min_events以上、既定8回）
+                # 3. または、ウィンドウが上限に達した
                 if (
                     len(clusters) >= self.config.candidate_min_unique
                     and events >= self.config.candidate_min_events
                 ) or window_days >= self.config.candidate_max_days:
                     break
+                
+                # データ不足の場合、ウィンドウを拡張して再試行
+                # 既定: 1.5倍ずつ拡張（candidate_expand_factor=1.5）
                 factor *= max(self.config.candidate_expand_factor, 1.0)
-            # loop exits with window_days/window_start defined
 
+        # ========================================
+        # ステップ2: ウィンドウ内候補の抽出（最優先）
+        # ========================================
+        # 適応ウィンドウ内で実際に放置したクラスタを候補として追加。
+        # これらは「この充電クラスタから放置した履歴がある」クラスタであり、最も信頼性が高い。
+        
         clusters = history.clusters_in_window(window_start)
         events_in_window = history.total_events_in_window(window_start)
         candidate_map: Dict[str, CandidateInfo] = {}
 
-        # 直近ウィンドウからの候補
         for cid in clusters:
+            # ウィンドウ内での訪問回数（利用回数）を取得
             freq = history.count_in_window(cid, window_start)
+            # 最後に訪問してからの経過時間（時間）を取得
             recency = history.last_visit_hours(cid, reference_time)
             candidate_map[cid] = CandidateInfo(
                 cluster_id=cid,
-                freq_in_window=freq,
+                freq_in_window=freq,  # 利用回数が多いほど後でランク上位になる
                 recency_hours=recency,
                 source="window",
                 in_window=True,
@@ -457,10 +691,15 @@ class CandidateGenerator:
                 events_in_window=events_in_window,
             )
 
-        # 直近訪問候補を追加
+        # ========================================
+        # ステップ3: 直近訪問候補の追加（補完）
+        # ========================================
+        # ウィンドウ外でも直近N回（candidate_recent_charge_count、既定10回）の充電で
+        # 訪れたクラスタは候補に含める。最新の行動変化を捉えるため。
+        
         for cid in history.recent_candidate_ids():
             if cid in candidate_map:
-                continue
+                continue  # 既にウィンドウ内候補として登録済みならスキップ
             freq = history.count_in_window(cid, window_start)
             recency = history.last_visit_hours(cid, reference_time)
             candidate_map[cid] = CandidateInfo(
@@ -473,15 +712,21 @@ class CandidateGenerator:
                 events_in_window=events_in_window,
             )
 
-        # 既知クラスタと距離でのフォールバック
+        # ========================================
+        # ステップ4: 距離ベースのフォールバック候補（不足時の補完）
+        # ========================================
+        # 上記でcandidate_top_k件に満たない場合、充電地点から距離が近いクラスタで埋める。
+        # 既知クラスタ（trainで観測されたクラスタ or これまでに訪問したクラスタ）のみを対象とし、
+        # 未知クラスタは除外（モデルが学習していないため予測精度が不安定）。
+        
         known_pool = list(dict.fromkeys(self.known_clusters + history.known_clusters()))
-        distance_ranking = self._distance_order_candidates(row)
+        distance_ranking = self._distance_order_candidates(row)  # 距離昇順でソート
         order = 1
         for cid in distance_ranking:
             if cid in candidate_map:
-                continue
+                continue  # 既に候補に含まれていればスキップ
             if known_pool and cid not in known_pool:
-                continue
+                continue  # 既知クラスタに限定
             freq = history.count_in_window(cid, window_start)
             recency = history.last_visit_hours(cid, reference_time)
             candidate_map[cid] = CandidateInfo(
@@ -492,13 +737,19 @@ class CandidateGenerator:
                 in_window=False,
                 window_days=window_days,
                 events_in_window=events_in_window,
-                distance_order=order,
+                distance_order=order,  # 距離順位を記録（近いほど小さい値）
             )
             order += 1
+            # candidate_top_k件に達したら打ち切り
             if len(candidate_map) >= self.config.candidate_top_k:
                 break
 
-        # 真値クラスタを必ず含める
+        # ========================================
+        # ステップ5: 真値クラスタの強制追加（学習時のみ）
+        # ========================================
+        # 学習データ作成時、正解クラスタが候補に含まれていないと正例が作れないため、
+        # 必ず候補に追加する。推論時はtrue_cluster=Noneなのでスキップされる。
+        
         if true_cluster is not None:
             true_cluster = str(true_cluster)
             if true_cluster not in candidate_map:
@@ -514,21 +765,36 @@ class CandidateGenerator:
                     events_in_window=events_in_window,
                 )
 
+        # ========================================
+        # ステップ6: 候補のランク付けとTOPK選択
+        # ========================================
+        # 優先度順にソート:
+        # 1. 真値クラスタ（学習時のみ、最優先）
+        # 2. source="window"（ウィンドウ内候補）> その他
+        # 3. freq_in_window降順（利用回数が多いほど上位）
+        # 4. recency_hours昇順（最近訪問したほど上位）
+        # 5. distance_order昇順（距離が近いほど上位）
+        # 6. cluster_id（同順位時の安定ソート用）
+        
         ranked = sorted(
             candidate_map.values(),
             key=lambda info: (
                 0 if true_cluster is not None and info.cluster_id == str(true_cluster) else 1,
-                info.source != "window",
-                -info.freq_in_window,
-                info.recency_hours,
-                info.distance_order if info.distance_order is not None else 9999,
+                info.source != "window",  # ウィンドウ内候補を優先
+                -info.freq_in_window,  # 利用回数降順
+                info.recency_hours,  # 最近訪問したほど優先
+                info.distance_order if info.distance_order is not None else 9999,  # 距離昇順
                 info.cluster_id,
             ),
         )
 
+        # TOPKに制限
         top_k = max(self.config.candidate_top_k, 1)
         limited = ranked[:top_k]
+        
+        # 最終チェック: 真値クラスタが落選していたら強制的に含める
         limited = self._ensure_true_candidate(limited, candidate_map, true_cluster)
+        
         return limited, window_days, events_in_window
 
 
@@ -562,7 +828,7 @@ class CandidateFeatureAssembler:
         centroid_lat, centroid_lon = self.centroids.get(cluster_id, (None, None))
         if centroid_lat is None or centroid_lon is None:
             return float("nan")
-        return round(haversine_km(charge_lat, charge_lon, centroid_lat, centroid_lon) * 1000.0, 0)
+        return round(haversine_meters(charge_lat, charge_lon, centroid_lat, centroid_lon), 0)
 
     def _resolve_delay(self, origin_cluster: Optional[str], target_cluster: str) -> float:
         if origin_cluster is not None:
@@ -660,112 +926,15 @@ class CandidateFeatureAssembler:
         return features
 
 
-class HeadSelector:
-    """HEADクラスタ（頻出放置候補）を抽出し、メタ情報を整理するヘルパークラス。
-
-    - train_df（充電→放置ペア）から直後放置の実績が多いクラスタを優先的に採用する。
-    - 枠が埋まらない場合のみ、inactiveセッション全体から補欠クラスタを追加する。
-    - 抽出結果は HeadClusterInfo に保持し、距離・時間統計の付与に利用する。
-    """
-
-    def __init__(self, config: PipelineConfig, sessions_df: pd.DataFrame) -> None:
-        """設定とセッション一覧を保持するだけの初期化処理。"""
-        self.config = config
-        self.sessions_df = sessions_df
-
-    def select(self, train_df: pd.DataFrame) -> Tuple[List[str], List[HeadClusterInfo]]:
-        """HEADクラスタのIDリストとメタ情報を返す。空の学習データなら即終了する。"""
-        if train_df.empty:
-            return [], []
-
-        after_charge = self._from_after_charge(train_df)
-        train_cutoff = train_df["charge_start_time"].max()
-
-        head_infos: Dict[str, HeadClusterInfo] = {}
-
-        after_charge = after_charge.sort_values(
-            ["count_after_charge", "hours_after_charge"], ascending=[False, False]
-        )
-        for _, row in after_charge.iterrows():
-            cid = str(row["cluster_id"])
-            if cid not in head_infos and len(head_infos) < self.config.head_k:  # 未採用＆枠に余裕があればHEAD入り
-                #  まずは「充電直後に長時間放置した実績」が多いクラスタをHEADに採用する。
-                # 既に選ばれている（もしくは枠が埋まった）場合は何もしない。
-                head_infos[cid] = HeadClusterInfo(
-                    cluster_id=cid,
-                    source="after_charge",
-                    count_after_charge=int(row["count_after_charge"]),
-                    hours_after_charge=float(row["hours_after_charge"]),
-                )
-
-        if len(head_infos) < self.config.head_k:  # 充電直後実績だけではK件に届かない場合のみ補欠を探す
-            #  充電後実績だけでは枠が埋まらないときに限り、通常放置の頻度で補欠を追加する。
-            anytime = self._from_anytime(train_cutoff)
-            anytime = anytime.sort_values(["count_anytime", "hours_anytime"], ascending=[False, False])
-            for _, row in anytime.iterrows():
-                if len(head_infos) >= self.config.head_k:  # これ以上追加するとK制約を超えるので打ち切り
-                    break  # HEAD枠が埋まったら補欠探索を終了する
-                cid = str(row["cluster_id"])
-                if cid in head_infos:  # 既存HEADクラスタは情報追記のみで新規採用はしない
-                    # 既に採用済みのクラスタには、参考情報として日常放置の件数/時間を追記するだけで、新規追加はしない。
-                    info = head_infos[cid]
-                    info.count_anytime = int(row["count_anytime"])
-                    info.hours_anytime = float(row["hours_anytime"])
-                    continue
-                head_infos[cid] = HeadClusterInfo(
-                    cluster_id=cid,
-                    source="anytime",
-                    count_anytime=int(row["count_anytime"]),
-                    hours_anytime=float(row["hours_anytime"]),
-                )
-
-        return list(head_infos.keys()), list(head_infos.values())
-
-    def _from_after_charge(self, train_df: pd.DataFrame) -> pd.DataFrame:
-        """充電直後の長時間放置実績をクラスタごとに集計する補助メソッド。"""
-        agg = (
-            train_df.groupby("next_long_inactive_cluster")
-            .agg(
-                count_after_charge=("next_long_inactive_cluster", "size"),
-                hours_after_charge=("inactive_time_minutes", lambda x: x.sum() / 60.0),
-            )
-            .reset_index()
-        )
-        agg.rename(columns={"next_long_inactive_cluster": "cluster_id"}, inplace=True)
-        return agg
-
-    def _from_anytime(self, train_cutoff: Timestamp) -> pd.DataFrame:
-        """inactiveセッション全体から長時間放置クラスタの統計を取得する。"""
-        sessions = self.sessions_df[
-            (self.sessions_df["session_type"] == "inactive")  # 放置イベントのみ抽出（充電・走行は除外）
-            & (
-                self.sessions_df["duration_minutes"] >= self.config.min_long_inactive_minutes
-            )  # 6時間以上の滞在に限定し、短時間放置をノイズ扱い
-            & (self.sessions_df["start_time"] <= train_cutoff)  # 学習期間より未来の情報はリークなので除外
-        ].copy()
-        sessions = sessions[sessions["session_cluster"] != "-1"]  # -1はノイズクラスタ。HEAD候補には採用しない
-        agg = (
-            sessions.groupby("session_cluster")
-            .agg(
-                count_anytime=("session_cluster", "size"),
-                hours_anytime=("duration_minutes", lambda x: x.sum() / 60.0),
-            )
-            .reset_index()
-        )
-        #  ここで得られるのは「充電条件を外した長時間放置の頻度」。HEADが埋まらないときの補欠要員として使う。
-        agg.rename(columns={"session_cluster": "cluster_id"}, inplace=True)
-        return agg
-
-
 class VisitStatisticsBuilder:
-    """§4で必要となる重心・遅延・時間分布を組み立てる。"""
+    """クラスタの重心・遅延・時間分布・遷移確率を算出する。"""
 
     def __init__(self, config: PipelineConfig, sessions_df: pd.DataFrame) -> None:
         """設定とセッション一覧を保持するだけの初期化処理。"""
         self.config = config
         self.sessions_df = sessions_df
 
-    def build(self, train_df: pd.DataFrame, head_clusters: Sequence[str]) -> Tuple[
+    def build(self, train_df: pd.DataFrame, train_clusters: Sequence[str]) -> Tuple[
         Dict[str, Tuple[Optional[float], Optional[float]]],
         Dict[str, float],
         Dict[Tuple[str, str], float],
@@ -773,18 +942,16 @@ class VisitStatisticsBuilder:
         Dict[str, Dict[object, Dict[str, float]]],
     ]:
         """重心・遅延・時間分布・遷移確率をまとめて計算し、後続の特徴量生成に渡す。"""
-        if not head_clusters:
+        if not train_clusters:
             return {}, {}, {}, {}, {}
-        #  HEADクラスタに関する統計は「学習で何を信じるか」の土台。
-        # 充電クラスタ×放置クラスタの遅延はデータが乏しいほど全体中央値へフォールバックするので、Noneではなく0.0で返すところに注目。
         train_cutoff = train_df["charge_start_time"].max()
-        centroids = self._centroids(train_df, head_clusters, train_cutoff)
-        cluster_delays, pair_delays = self._delays(train_df, head_clusters)
-        p_start = self._p_start(head_clusters, train_cutoff)
+        centroids = self._centroids(train_df, train_clusters, train_cutoff)
+        cluster_delays, pair_delays = self._delays(train_df, train_clusters)
+        p_start = self._p_start(train_clusters, train_cutoff)
         if self.config.feature_toggles.use_prev_transition:
-            transitions = self._transitions(train_df, head_clusters)
+            transitions = self._transitions(train_df, train_clusters)
         else:
-            base_targets = set(head_clusters) | {OTHER_LABEL}
+            base_targets = set(train_clusters) | {OTHER_LABEL}
             if not base_targets:
                 base_targets = {OTHER_LABEL}
             uniform_prob = 1.0 / len(base_targets)
@@ -796,62 +963,59 @@ class VisitStatisticsBuilder:
     def _centroids(
         self,
         train_df: pd.DataFrame,
-        head_clusters: Sequence[str],
+        train_clusters: Sequence[str],
         train_cutoff: Timestamp,
     ) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
-        """HEADクラスタごとの代表座標をtrainデータ＋通常セッションから推定する。"""
+        """クラスタごとの代表座標をtrainデータ＋通常セッションから推定する。"""
         centroids: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
 
         if {"inactive_lat", "inactive_lon"}.issubset(train_df.columns):
-            #  まずは学習用データ（充電→放置のペア）だけで重心を求め、実績から逆算する。
             grouped = train_df.groupby("next_long_inactive_cluster")[
                 ["inactive_lat", "inactive_lon"]
             ].median()
-            for cid in head_clusters:
+            for cid in train_clusters:
                 if cid in grouped.index:
                     lat, lon = grouped.loc[cid].tolist()
                     centroids[cid] = (float(lat), float(lon))
 
         candidates = self.sessions_df[
             (self.sessions_df["session_type"] == "inactive")
-            & (self.sessions_df["session_cluster"].isin(head_clusters))
+            & (self.sessions_df["session_cluster"].isin(train_clusters))
             & (self.sessions_df["start_time"] <= train_cutoff)
         ]
         if not candidates.empty:
-            # 学習期間外の通常放置セッションも統計に取り込み、欠損した重心を補う。
             med = candidates.groupby("session_cluster")[
                 ["start_lat", "start_lon"]
             ].median()
-            for cid in head_clusters:
+            for cid in train_clusters:
                 if cid in med.index and cid not in centroids:
                     lat, lon = med.loc[cid].tolist()
                     centroids[cid] = (float(lat), float(lon))
 
-        for cid in head_clusters:
+        for cid in train_clusters:
             centroids.setdefault(cid, (None, None))
         return centroids
 
     def _delays(
-        self, train_df: pd.DataFrame, head_clusters: Sequence[str]
+        self, train_df: pd.DataFrame, train_clusters: Sequence[str]
     ) -> Tuple[Dict[str, float], Dict[Tuple[str, str], float]]:
         """クラスタ単位およびステーション×クラスタ単位の遅延統計を求める。"""
         if train_df.empty:
-            base = {cid: 0.0 for cid in head_clusters}
+            base = {cid: 0.0 for cid in train_clusters}
             return base, {}
 
         delays = train_df["inactive_start_time"] - train_df["charge_start_time"]
         delays_hours = delays.dt.total_seconds() / 3600.0
-        #  遅延の中央値は「充電→放置までの感覚」を表す。異常値が多いので平均ではなく中央値を採用している。
         overall = float(np.median(delays_hours.dropna())) if not delays_hours.dropna().empty else 0.0
 
         cluster_delay_map: Dict[str, float] = {}
         grouped = train_df.groupby("next_long_inactive_cluster")
-        for cid in head_clusters:
+        for cid in train_clusters:
             if cid in grouped.groups:
                 values = delays_hours.loc[grouped.groups[cid]].dropna()
                 if len(values) >= self.config.min_delay_samples:
                     cluster_delay_map[cid] = float(np.median(values))
-        for cid in head_clusters:
+        for cid in train_clusters:
             cluster_delay_map.setdefault(cid, overall)
             cluster_delay_map[cid] = float(np.clip(cluster_delay_map[cid], 0.0, self.config.max_time_shift_hours))
 
@@ -861,11 +1025,9 @@ class VisitStatisticsBuilder:
                 train_df.dropna(subset=["charge_cluster", "next_long_inactive_cluster"])
                 .groupby(["charge_cluster", "next_long_inactive_cluster"])
             )
-            #  充電ステーションごとに放置先の遅延傾向が異なるので、可能な限りペア単位で中央値を計算する。
-            # サンプルが少ないときはmin_pair_delay_samplesで足切りし、過学習を避ける。
             for (charge_cluster, target_cluster), indexer in pair_group.groups.items():
                 target_cluster_str = str(target_cluster)
-                if target_cluster_str not in head_clusters:
+                if target_cluster_str not in train_clusters:
                     continue
                 values = delays_hours.loc[indexer].dropna()
                 if len(values) >= self.config.min_pair_delay_samples:
@@ -876,7 +1038,7 @@ class VisitStatisticsBuilder:
 
         return cluster_delay_map, pair_delay_map
 
-    def _p_start(self, head_clusters: Sequence[str], train_cutoff: Timestamp) -> Dict[str, np.ndarray]:
+    def _p_start(self, train_clusters: Sequence[str], train_cutoff: Timestamp) -> Dict[str, np.ndarray]:
         """曜日×時間帯の開始確率行列（time_compat辞書）を構築する。"""
         alpha = self.config.laplace_alpha
         bins_per_day = int(24 / self.config.time_bin_hours)
@@ -885,11 +1047,11 @@ class VisitStatisticsBuilder:
         sessions = self.sessions_df[
             (self.sessions_df["session_type"] == "inactive")
             & (self.sessions_df["duration_minutes"] >= self.config.min_long_inactive_minutes)
-            & (self.sessions_df["session_cluster"].isin(head_clusters))
+            & (self.sessions_df["session_cluster"].isin(train_clusters))
             & (self.sessions_df["start_time"] <= train_cutoff)
         ]
 
-        for cid in head_clusters:
+        for cid in train_clusters:
             matrix = np.full((7, bins_per_day), alpha, dtype=float)
             cluster_sessions = sessions[sessions["session_cluster"] == cid]
             if not cluster_sessions.empty:
@@ -907,7 +1069,7 @@ class VisitStatisticsBuilder:
 
 
     def _transitions(
-        self, train_df: pd.DataFrame, head_clusters: Sequence[str]
+        self, train_df: pd.DataFrame, train_clusters: Sequence[str]
     ) -> Dict[str, Dict[object, Dict[str, float]]]:
         """prevクラスタ×曜日×時間帯から次クラスタへの遷移確率を算出する。"""
         alpha = self.config.laplace_alpha
@@ -918,7 +1080,7 @@ class VisitStatisticsBuilder:
         counts_global_total: Dict[str, float] = defaultdict(float)
 
         if train_df.empty or "prev_long_inactive_cluster" not in train_df.columns:
-            base_targets = set(head_clusters) | {OTHER_LABEL}
+            base_targets = set(train_clusters) | {OTHER_LABEL}
             if not base_targets:
                 base_targets = {OTHER_LABEL}
             denominator = float(len(base_targets)) if base_targets else 1.0
@@ -951,7 +1113,7 @@ class VisitStatisticsBuilder:
             counts_global_time[key][target_cluster] += 1.0
             counts_global_total[target_cluster] += 1.0
 
-        all_targets = set(head_clusters) | set(counts_global_total.keys()) | {OTHER_LABEL}
+        all_targets = set(train_clusters) | set(counts_global_total.keys()) | {OTHER_LABEL}
         if not all_targets:
             all_targets = {OTHER_LABEL}
 
@@ -977,191 +1139,6 @@ class VisitStatisticsBuilder:
         global_bucket[DEFAULT_BIN_KEY] = normalize(counts_global_total)
         transitions[GLOBAL_TRANS_KEY] = global_bucket
         return transitions
-class ClassFeatureAssembler:
-    """§4.2 クラスタ依存特徴を生成する。"""
-
-    def __init__(self, config: PipelineConfig) -> None:
-        """クラスタ依存特徴を作成する際の設定値とトグルを保持する。"""
-        self.config = config
-        self.toggles = config.feature_toggles
-
-    def transform(
-        self,
-        model_df: pd.DataFrame,
-        head_clusters: Sequence[str],
-        centroids: Dict[str, Tuple[Optional[float], Optional[float]]],
-        cluster_delays: Dict[str, float],
-        pair_delays: Dict[Tuple[str, str], float],
-        p_start: Dict[str, np.ndarray],
-        transitions: Dict[str, Dict[object, Dict[str, float]]],
-    ) -> pd.DataFrame:
-        """距離・頻度・再訪間隔・時間適合度・遷移確率を横持ちで組み立てる。"""
-        records: Dict[str, List[float]] = {}
-        toggles = self.toggles
-
-        for cid in head_clusters:
-            if toggles.use_distance:
-                records[f"dist_to_{cid}"] = []
-            if toggles.use_frequency:
-                records[f"freq_hashvin_{cid}"] = []
-            if toggles.use_recency:
-                records[f"recency_{cid}_h"] = []
-            if toggles.use_time_compat:
-                records[f"time_compat_{cid}"] = []
-            if toggles.use_prev_transition:
-                records[f"transition_from_prev_to_{cid}"] = []
-
-        head_count = max(len(head_clusters), 1)
-        freq_events = {cid: deque() for cid in head_clusters}
-        last_visit_state = {cid: None for cid in head_clusters}
-        window_days = max(float(self.config.frequency_window_days), 0.0)
-        freq_window = pd.Timedelta(days=window_days) if window_days > 0 else None
-        #  dequeで「直近frequency_window_daysに起きた訪問時刻」だけを保持し、ウィンドウ外のものはその場で捨てる。
-        # ここを素直なカウントで書くとO(N^2)になるので、双方向キューで効率良く削除している。
-
-        for _, row in model_df.iterrows():
-            charge_lat = row.get("charge_lat")
-            charge_lon = row.get("charge_lon")
-            charge_start: Timestamp = row["charge_start_time"]
-            origin_cluster_raw = row.get("charge_cluster")
-            origin_cluster = str(origin_cluster_raw) if pd.notna(origin_cluster_raw) else None
-            prev_cluster_raw = row.get("prev_long_inactive_cluster")
-            prev_cluster = str(prev_cluster_raw) if pd.notna(prev_cluster_raw) else None
-
-            for cid in head_clusters:
-                centroid_lat, centroid_lon = centroids.get(cid, (None, None))
-
-                if toggles.use_distance:
-                    if centroid_lat is None or centroid_lon is None or pd.isna(charge_lat) or pd.isna(charge_lon):
-                        dist_value = float("nan")
-                    else:
-                        dist_value = haversine_km(charge_lat, charge_lon, centroid_lat, centroid_lon)
-                        # メートル単位の整数に変換してモデルが扱いやすいスケールに調整
-                        dist_value = round(dist_value * 1000.0, 0)
-                    # NaNはそのまま残し、学習時に欠損扱いに任せる
-                    records[f"dist_to_{cid}"].append(dist_value if not math.isnan(dist_value) else float("nan"))
-
-                if toggles.use_frequency:
-                    events = freq_events[cid]
-                    if freq_window is not None and not pd.isna(charge_start):
-                        cutoff = charge_start - freq_window
-                        # ウィンドウ外（古すぎる訪問）は左端から順次捨てる。dequeを使っているのはこのポップ処理がO(1)になるため。
-                        while events and events[0] < cutoff:
-                            events.popleft()
-                    records[f"freq_hashvin_{cid}"].append(len(events) + self.config.laplace_alpha)
-
-                if toggles.use_recency:
-                    last_visit = last_visit_state.get(cid)
-                    if last_visit is None:
-                        recency = self.config.recency_default_hours
-                    else:
-                        delta = (charge_start - last_visit).total_seconds() / 3600.0
-                        recency = float(max(delta, 0.0))
-                    records[f"recency_{cid}_h"].append(recency)
-
-                if toggles.use_time_compat:
-                    matrix = p_start.get(cid)
-                    delay = self._resolve_delay(origin_cluster, cid, cluster_delays, pair_delays)
-                    #  delayはcharge_cluster→cidのペア遅延を優先し、なければクラスタ単体の中央値にフォールバックする。
-                    # こうすることで「自宅→自宅」のような即時放置と「職場→自宅」のような長距離を区別できる。
-                    score = self._time_compat_score(charge_start, matrix, delay)
-                    records[f"time_compat_{cid}"].append(score)
-
-                if toggles.use_prev_transition:
-                    trans_prob = self._transition_score(prev_cluster, cid, charge_start, transitions, head_count)
-                    records[f"transition_from_prev_to_{cid}"].append(trans_prob)
-
-            if row["split"] == "train":
-                target = row["next_long_inactive_cluster"]
-                if target in head_clusters:
-                    event_time = row.get("inactive_start_time")
-                    if pd.notna(event_time):
-                        freq_events[target].append(event_time)
-                        last_visit_state[target] = event_time
-
-        return pd.DataFrame(records, index=model_df.index)
-
-    def _resolve_delay(
-        self,
-        origin_cluster: Optional[str],
-        target_cluster: str,
-        cluster_delays: Dict[str, float],
-        pair_delays: Dict[Tuple[str, str], float],
-    ) -> float:
-        """ペア専用遅延があればそれを優先し、なければクラスタ遅延を返す。"""
-        if origin_cluster is not None:
-            key = (origin_cluster, target_cluster)
-            if key in pair_delays:
-                return pair_delays[key]
-        return cluster_delays.get(target_cluster, 0.0)
-
-    def _time_compat_score(
-        self,
-        charge_start: Timestamp,
-        matrix: Optional[np.ndarray],
-        delay_hours: float,
-    ) -> float:
-        """指定された遅延後の時間帯における開始確率を近傍補間付きで算出する。"""
-        if matrix is None or charge_start is pd.NaT:
-            return 1.0 / (7 * max(1, int(24 / self.config.time_bin_hours)))
-        target_time = charge_start + pd.Timedelta(hours=delay_hours)
-        bins_per_day = int(24 / self.config.time_bin_hours)
-        dow = target_time.weekday()
-        hour = target_time.hour + target_time.minute / 60.0
-        bin_idx = int(hour // self.config.time_bin_hours) % bins_per_day
-        neighbor_idx = (bin_idx - 1) % bins_per_day
-        primary = matrix[dow, bin_idx]
-        neighbor = matrix[dow, neighbor_idx]
-        return float(0.75 * primary + 0.25 * neighbor)
-
-    def _transition_score(
-        self,
-        prev_cluster: Optional[str],
-        target_cluster: str,
-        charge_start: Timestamp,
-        transitions: Dict[str, Dict[object, Dict[str, float]]],
-        head_cluster_count: int,
-    ) -> float:
-        """prevクラスタ・時間帯から次クラスタへの遷移確率を取得する。"""
-        bucket: Optional[Dict[object, Dict[str, float]]] = None
-        search_key = str(prev_cluster) if prev_cluster else None
-        if search_key and search_key in transitions:
-            bucket = transitions.get(search_key)
-        if bucket is None:
-            bucket = transitions.get(GLOBAL_TRANS_KEY, {})
-        probs: Optional[Dict[str, float]] = None
-        if charge_start is not pd.NaT and bucket:
-            local_time = (
-                charge_start.tz_convert("Asia/Tokyo")
-                if getattr(charge_start, "tz", None) is not None
-                else charge_start.tz_localize("Asia/Tokyo")
-            )
-            bins_per_day = int(24 / self.config.time_bin_hours)
-            hour = local_time.hour + local_time.minute / 60.0
-            bin_idx = int(hour // self.config.time_bin_hours) % bins_per_day
-            key = (local_time.weekday(), bin_idx)
-            probs = bucket.get(key)
-        if probs is None and bucket is not None:
-            probs = bucket.get(DEFAULT_BIN_KEY)
-        if probs is None:
-            global_bucket = transitions.get(GLOBAL_TRANS_KEY, {})
-            if charge_start is not pd.NaT and global_bucket:
-                local_time = (
-                    charge_start.tz_convert("Asia/Tokyo")
-                    if getattr(charge_start, "tz", None) is not None
-                    else charge_start.tz_localize("Asia/Tokyo")
-                )
-                bins_per_day = int(24 / self.config.time_bin_hours)
-                hour = local_time.hour + local_time.minute / 60.0
-                bin_idx = int(hour // self.config.time_bin_hours) % bins_per_day
-                key = (local_time.weekday(), bin_idx)
-                probs = global_bucket.get(key)
-            if probs is None:
-                probs = global_bucket.get(DEFAULT_BIN_KEY) if global_bucket else None
-        if probs is None or head_cluster_count == 0:
-            return 1.0 / max(head_cluster_count, 1)
-        return float(probs.get(target_cluster, probs.get(OTHER_LABEL, 1.0 / head_cluster_count)))
-
 class CommonFeatureAssembler:
     """共通（クラスタ非依存）特徴量を生成する責務を持つクラス。
 
@@ -1234,40 +1211,8 @@ class CommonFeatureAssembler:
                 dow_labels, categories=["mon", "tue", "wed", "thu", "fri", "sat", "sun", "unknown"], ordered=False
             )
 
-        if self.toggles.use_prev_vector and {"prev_inactive_lat", "prev_inactive_lon", "charge_lat", "charge_lon"}.issubset(model_df.columns):
-            prev_lat = pd.to_numeric(model_df["prev_inactive_lat"], errors="coerce")
-            prev_lon = pd.to_numeric(model_df["prev_inactive_lon"], errors="coerce")
-            charge_lat_series = pd.to_numeric(model_df["charge_lat"], errors="coerce")
-            charge_lon_series = pd.to_numeric(model_df["charge_lon"], errors="coerce")
-            avg_lat = (prev_lat + charge_lat_series) / 2.0
-            delta_lat = charge_lat_series - prev_lat
-            delta_lon = charge_lon_series - prev_lon
-            delta_lat_m = delta_lat * 111_320.0
-            delta_lon_m = delta_lon * (40075000.0 * np.cos(np.radians(avg_lat)) / 360.0)
-            distance_m = np.vectorize(
-                lambda la1, lo1, la2, lo2: np.nan
-                if np.any(np.isnan([la1, lo1, la2, lo2]))
-                else haversine_km(la1, lo1, la2, lo2) * 1000.0
-            )(prev_lat, prev_lon, charge_lat_series, charge_lon_series)
-            columns["prev_to_charge_delta_lat_m"] = pd.Series(delta_lat_m, index=model_df.index)
-            columns["prev_to_charge_delta_lon_m"] = pd.Series(delta_lon_m, index=model_df.index)
-            columns["prev_to_charge_distance_m"] = pd.Series(distance_m, index=model_df.index)
-
         # SOCの開始値は常に保持しておく（欠損はそのままNaN）。
         columns["soc_start"] = model_df.get("charge_start_soc")
-
-        if self.toggles.use_behavior_flags:
-            # 帰宅帯（18-6時）や通勤帯（朝/日中）など、ドメイン知識ベースの粗いフラグ。
-            hour_int = charge_start_naive.dt.hour
-            columns.update(
-                {
-                    "is_return_band": ((hour_int >= 18) | (hour_int < 6)).astype("Int8", copy=False),
-                    "is_commute_band": (
-                        ((hour_int >= 7) & (hour_int < 10)) | ((hour_int >= 9) & (hour_int < 18))
-                    ).astype("Int8", copy=False),
-                    "weekend_flag": charge_start_naive.dt.weekday.isin([5, 6]).astype("Int8", copy=False),
-                }
-            )
 
         common_df = pd.DataFrame(columns, index=model_df.index)
 
@@ -1447,14 +1392,12 @@ class HashvinProcessor:
         return model_df
 
     def build_features(self) -> HashvinResult:
-        """要件§2〜§7に沿って候補生成＋二値スコアリング用テーブルを構築する。"""
+        """候補生成＋二値スコアリング用テーブルを構築する。"""
         model_df = self._select_model_rows()
         if model_df.empty:
             empty = {split: model_df.copy() for split in ["train", "valid", "test"]}
             return HashvinResult(
                 hashvin=self.hashvin,
-                head_clusters=[],
-                head_details=[],
                 features=model_df,
                 split_datasets=empty,
                 label_col="label",
@@ -1465,7 +1408,7 @@ class HashvinProcessor:
 
         train_df = model_df[model_df["split"] == "train"].copy()
         train_clusters = sorted(train_df["next_long_inactive_cluster"].dropna().astype(str).unique().tolist())
-        base_window_days = compute_charge_interval_median(train_df)
+        base_window_days = compute_charge_interval_median(train_df, self.config.default_charge_interval_days)
 
         stats_builder = VisitStatisticsBuilder(self.config, self.sessions_df)
         centroids, cluster_delays, pair_delays, p_start, transitions = stats_builder.build(
@@ -1481,6 +1424,8 @@ class HashvinProcessor:
             centroids=centroids,
             known_clusters=train_clusters,
             base_window_days=base_window_days,
+            sessions_df=self.sessions_df,
+            train_cutoff=train_df["charge_start_time"].max() if not train_df.empty else None,
         )
         candidate_feature = CandidateFeatureAssembler(
             config=self.config,
@@ -1527,29 +1472,38 @@ class HashvinProcessor:
             empty = {split: feature_df.copy() for split in ["train", "valid", "test"]}
             return HashvinResult(
                 hashvin=self.hashvin,
-                head_clusters=train_clusters,
-                head_details=[],
                 features=feature_df,
                 split_datasets=empty,
                 label_col="label",
             )
 
-        leak_cols = [
-            "charge_durations_minutes",
-            "charge_duration_minutes",
-            "charge_end_soc",
-            "soc_delta",
-            "end_soc",
-            "charge_start_time",
-            "inactive_lat",
-            "inactive_lon",
-            "inactive_start_time",
-            "inactive_end_time",
-            "charge_end_time",
-        ]
-        existing_leak_cols = [col for col in leak_cols if col in feature_df.columns]
-        if existing_leak_cols:
-            feature_df = feature_df.drop(columns=existing_leak_cols)
+        # 生成した特徴量以外の元データ列を削除（充電クラスタは特徴量として保持）
+        generated_feature_cols = {
+            # 候補依存特徴
+            "cand_distance_m", "cand_freq_in_window", "cand_freq_log", "cand_recency_hours",
+            "cand_window_days", "cand_events_in_window", "cand_source", "cand_in_window",
+            "cand_distance_order", "cand_time_compat", "cand_transition_prev",
+            # 共通特徴
+            "dow", "hour_sin", "hour_cos", "time_raw_charge_start", "time_raw_timestamp",
+            "time_band_2h", "time_dow_category", "soc_start",
+            # 当日行動ヒストグラム（daily_bin_で始まる列）
+            # station種別（station_で始まる列）
+            # メタ列
+            "candidate_cluster", "label", "true_cluster", "cand_set_size",
+            "cand_window_total_events", "session_uid", "split", "hashvin",
+            # 充電クラスタ（特徴量として保持）
+            "charge_cluster",
+        }
+        
+        # daily_bin_とstation_で始まる列を追加
+        for col in feature_df.columns:
+            if col.startswith("daily_bin_") or col.startswith("station_"):
+                generated_feature_cols.add(col)
+        
+        # 生成された特徴量以外の列を削除
+        cols_to_drop = [col for col in feature_df.columns if col not in generated_feature_cols]
+        if cols_to_drop:
+            feature_df = feature_df.drop(columns=cols_to_drop)
 
         split_datasets = {
             split: feature_df[feature_df["split"] == split].copy() for split in ["train", "valid", "test"]
@@ -1557,16 +1511,7 @@ class HashvinProcessor:
 
         return HashvinResult(
             hashvin=self.hashvin,
-            head_clusters=train_clusters,
-            head_details=[],
             features=feature_df,
             split_datasets=split_datasets,
             label_col="label",
         )
-
-
-
-def save_head_details(head_details: Sequence[HeadClusterInfo], output_path: Path) -> None:
-    """HEAD抽出結果をJSONで保存（§3・§8）。"""
-    data = [info.to_dict() for info in head_details]
-    output_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
