@@ -204,7 +204,9 @@ behavior_map = visualizer.create_behavior_map(
 | パラメータ | デフォルト | 説明 |
 |-----------|-----------|------|
 | `hour_bin_size` | 1 | 時間ビンサイズ（時間） |
-| `topK_clusters` | 20 | 上位クラスタ数 |
+| **`use_topk_per_hour`** | **True** | **時間帯ごとTOP-K方式を使用（推奨）** |
+| **`topk_per_hour`** | **3** | **各時間帯のTOP-Kクラスタ数** |
+| `topK_clusters` | 20 | 上位クラスタ数（従来方式用） |
 | `topK_transitions` | 15 | 上位遷移パターン数 |
 | `clustering_method` | 'kmeans' | 'kmeans' or 'hdbscan' |
 | `k_range` | (3, 10) | KMeansのk値探索範囲 |

@@ -170,6 +170,129 @@ class DailyBehaviorVectorizer:
         
         return pd.DataFrame(transitions_list)
     
+    def _create_full_vectors(self, daily_df: pd.DataFrame, hour_bins: List[str]) -> pd.DataFrame:
+        """
+        従来方式：全クラスタを展開したベクトルを作成
+        
+        Args:
+            daily_df (pd.DataFrame): 日ごとに分割されたセッションデータ
+            hour_bins (List[str]): 時間ビンのリスト
+            
+        Returns:
+            pd.DataFrame: 日次行動ベクトル（全クラスタ展開）
+        """
+        records = []
+        for (hashvin, date06), group in daily_df.groupby(['hashvin', 'date06']):
+            # 時間ビン×クラスタの滞在時間を集計
+            bin_cluster_minutes: Dict[Tuple[str, str], float] = {}
+            
+            for _, row in group.iterrows():
+                bin_minutes = self.time_processor.assign_to_hour_bins(
+                    row['start'], row['end'], date06
+                )
+                
+                cluster = row['session_cluster']
+                for bin_label, minutes in bin_minutes.items():
+                    key = (bin_label, cluster)
+                    bin_cluster_minutes[key] = bin_cluster_minutes.get(key, 0) + minutes
+            
+            # ベクトル化
+            record = {
+                'hashvin': hashvin,
+                'date06': date06
+            }
+            
+            total_minutes = 0
+            for hour_bin in hour_bins:
+                for cluster in self.top_clusters_:
+                    minutes = bin_cluster_minutes.get((hour_bin, cluster), 0)
+                    record[f'ratio__{hour_bin}__{cluster}'] = minutes
+                    total_minutes += minutes
+                
+                # OTHER集約
+                other_minutes = sum(
+                    minutes for (bin_label, clust), minutes in bin_cluster_minutes.items()
+                    if bin_label == hour_bin and clust not in self.top_clusters_
+                )
+                record[f'ratio_OTHER__{hour_bin}'] = other_minutes
+                total_minutes += other_minutes
+            
+            record['total_minutes'] = total_minutes
+            record['weekday'] = date06.weekday()
+            record['is_empty_day'] = 1 if total_minutes == 0 else 0
+            
+            records.append(record)
+        
+        return pd.DataFrame(records)
+    
+    def _create_topk_vectors(self, daily_df: pd.DataFrame, hour_bins: List[str]) -> pd.DataFrame:
+        """
+        TOP-K方式：各時間帯でTOP-K個のクラスタのみを記録
+        
+        Args:
+            daily_df (pd.DataFrame): 日ごとに分割されたセッションデータ
+            hour_bins (List[str]): 時間ビンのリスト
+            
+        Returns:
+            pd.DataFrame: 日次行動ベクトル（TOP-K形式）
+        """
+        records = []
+        topk = self.config.topk_per_hour
+        
+        for (hashvin, date06), group in daily_df.groupby(['hashvin', 'date06']):
+            # 時間ビン×クラスタの滞在時間を集計
+            bin_cluster_minutes: Dict[Tuple[str, str], float] = {}
+            
+            for _, row in group.iterrows():
+                bin_minutes = self.time_processor.assign_to_hour_bins(
+                    row['start'], row['end'], date06
+                )
+                
+                cluster = row['session_cluster']
+                for bin_label, minutes in bin_minutes.items():
+                    key = (bin_label, cluster)
+                    bin_cluster_minutes[key] = bin_cluster_minutes.get(key, 0) + minutes
+            
+            # ベクトル化（TOP-K方式）
+            record = {
+                'hashvin': hashvin,
+                'date06': date06
+            }
+            
+            total_minutes = 0
+            
+            # 各時間帯ごとにTOP-Kクラスタを抽出
+            for hour_bin in hour_bins:
+                # その時間帯のクラスタ×滞在時間を取得
+                bin_data = {
+                    cluster: minutes 
+                    for (bin_label, cluster), minutes in bin_cluster_minutes.items()
+                    if bin_label == hour_bin
+                }
+                
+                # 滞在時間でソート（降順）
+                sorted_clusters = sorted(bin_data.items(), key=lambda x: x[1], reverse=True)
+                
+                # TOP-K個を記録
+                for k in range(topk):
+                    if k < len(sorted_clusters):
+                        cluster, minutes = sorted_clusters[k]
+                        record[f'top{k+1}_{hour_bin}_cluster'] = cluster
+                        record[f'top{k+1}_{hour_bin}_ratio'] = minutes
+                        total_minutes += minutes
+                    else:
+                        # クラスタが不足している場合は空文字列と0
+                        record[f'top{k+1}_{hour_bin}_cluster'] = ''
+                        record[f'top{k+1}_{hour_bin}_ratio'] = 0.0
+            
+            record['total_minutes'] = total_minutes
+            record['weekday'] = date06.weekday()
+            record['is_empty_day'] = 1 if total_minutes == 0 else 0
+            
+            records.append(record)
+        
+        return pd.DataFrame(records)
+    
     def _add_transition_features(self, result_df: pd.DataFrame, df_sessions: pd.DataFrame) -> pd.DataFrame:
         """
         遷移特徴量を追加
@@ -272,53 +395,18 @@ class DailyBehaviorVectorizer:
         print(f"  元のセッション数: {len(df)}")
         print(f"  分割後のセグメント数: {len(daily_df)}")
         
-        # 時間ビンへの按分
+        # 時間ビンへの按分とベクトル化
         print("\n時間ビンへの按分処理中...")
         hour_bins = self.time_processor.get_hour_bins()
         
-        records = []
-        for (hashvin, date06), group in daily_df.groupby(['hashvin', 'date06']):
-            # 時間ビン×クラスタの滞在時間を集計
-            bin_cluster_minutes: Dict[Tuple[str, str], float] = {}
-            
-            for _, row in group.iterrows():
-                bin_minutes = self.time_processor.assign_to_hour_bins(
-                    row['start'], row['end'], date06
-                )
-                
-                cluster = row['session_cluster']
-                for bin_label, minutes in bin_minutes.items():
-                    key = (bin_label, cluster)
-                    bin_cluster_minutes[key] = bin_cluster_minutes.get(key, 0) + minutes
-            
-            # ベクトル化
-            record = {
-                'hashvin': hashvin,
-                'date06': date06
-            }
-            
-            total_minutes = 0
-            for hour_bin in hour_bins:
-                for cluster in self.top_clusters_:
-                    minutes = bin_cluster_minutes.get((hour_bin, cluster), 0)
-                    record[f'ratio__{hour_bin}__{cluster}'] = minutes
-                    total_minutes += minutes
-                
-                # OTHER集約
-                other_minutes = sum(
-                    minutes for (bin_label, clust), minutes in bin_cluster_minutes.items()
-                    if bin_label == hour_bin and clust not in self.top_clusters_
-                )
-                record[f'ratio_OTHER__{hour_bin}'] = other_minutes
-                total_minutes += other_minutes
-            
-            record['total_minutes'] = total_minutes
-            record['weekday'] = date06.weekday()
-            record['is_empty_day'] = 1 if total_minutes == 0 else 0
-            
-            records.append(record)
+        # TOP-K方式と従来方式で分岐
+        if self.config.use_topk_per_hour:
+            print(f"  時間帯ごとTOP-{self.config.topk_per_hour}方式を使用")
+            result_df = self._create_topk_vectors(daily_df, hour_bins)
+        else:
+            print(f"  全クラスタ展開方式を使用（上位{len(self.top_clusters_)}クラスタ）")
+            result_df = self._create_full_vectors(daily_df, hour_bins)
         
-        result_df = pd.DataFrame(records)
         result_df = result_df.set_index(['hashvin', 'date06'])
         
         # 遷移特徴量の追加
@@ -328,12 +416,23 @@ class DailyBehaviorVectorizer:
         
         # 正規化（比率化）
         print("\n滞在比率への正規化中...")
-        ratio_cols = [col for col in result_df.columns if col.startswith('ratio__')]
         
-        for idx in result_df.index:
-            total = result_df.loc[idx, 'total_minutes']
-            if total > 0:
-                result_df.loc[idx, ratio_cols] = result_df.loc[idx, ratio_cols] / total
+        if self.config.use_topk_per_hour:
+            # TOP-K方式：top{k}_{hour}_ratio列を正規化
+            ratio_cols = [col for col in result_df.columns if col.endswith('_ratio')]
+            
+            for idx in result_df.index:
+                total = result_df.loc[idx, 'total_minutes']
+                if total > 0:
+                    result_df.loc[idx, ratio_cols] = result_df.loc[idx, ratio_cols] / total
+        else:
+            # 従来方式：ratio__列を正規化
+            ratio_cols = [col for col in result_df.columns if col.startswith('ratio__')]
+            
+            for idx in result_df.index:
+                total = result_df.loc[idx, 'total_minutes']
+                if total > 0:
+                    result_df.loc[idx, ratio_cols] = result_df.loc[idx, ratio_cols] / total
         
         # 品質チェック
         print("\n品質チェック実行中...")
@@ -354,32 +453,50 @@ class DailyBehaviorVectorizer:
         Args:
             df (pd.DataFrame): 日次行動ベクトル
         """
-        ratio_cols = [col for col in df.columns if col.startswith('ratio__')]
-        
-        # 各行の合計が1±1e-3内かチェック
-        row_sums = df[ratio_cols].sum(axis=1)
-        non_empty_rows = df[df['is_empty_day'] == 0]
-        
-        if len(non_empty_rows) > 0:
-            non_empty_sums = row_sums[non_empty_rows.index]
-            max_deviation = (non_empty_sums - 1.0).abs().max()
+        if self.config.use_topk_per_hour:
+            # TOP-K方式の品質チェック
+            ratio_cols = [col for col in df.columns if col.endswith('_ratio')]
             
-            if max_deviation > 1e-3:  # 許容範囲を緩和（浮動小数点誤差考慮）
-                warnings.warn(f"警告: 行合計の最大偏差が許容範囲を超えています: {max_deviation}")
-            else:
-                print(f"  [OK] 行合計チェック: OK (最大偏差={max_deviation:.2e})")
-        
-        # 各時間帯で合計が≤1を保証
-        hour_bins = self.time_processor.get_hour_bins()
-        max_hourly_violation = 0
-        for hour_bin in hour_bins:
-            bin_cols = [col for col in ratio_cols if f'__{hour_bin}__' in col]
-            hourly_sums = df[bin_cols].sum(axis=1)
-            max_hourly = hourly_sums.max()
+            # 各行の合計が1±1e-3内かチェック
+            row_sums = df[ratio_cols].sum(axis=1)
+            non_empty_rows = df[df['is_empty_day'] == 0]
             
-            if max_hourly > 1.0 + 1e-3:
-                max_hourly_violation = max(max_hourly_violation, max_hourly - 1.0)
-        
-        if max_hourly_violation > 0:
-            warnings.warn(f"警告: 一部の時間帯で合計が1を超えています (最大超過: {max_hourly_violation:.3f})")
+            if len(non_empty_rows) > 0:
+                non_empty_sums = row_sums[non_empty_rows.index]
+                max_deviation = (non_empty_sums - 1.0).abs().max()
+                
+                if max_deviation > 1e-3:
+                    warnings.warn(f"警告: 行合計の最大偏差が許容範囲を超えています: {max_deviation}")
+                else:
+                    print(f"  [OK] 行合計チェック: OK (最大偏差={max_deviation:.2e})")
+        else:
+            # 従来方式の品質チェック
+            ratio_cols = [col for col in df.columns if col.startswith('ratio__')]
+            
+            # 各行の合計が1±1e-3内かチェック
+            row_sums = df[ratio_cols].sum(axis=1)
+            non_empty_rows = df[df['is_empty_day'] == 0]
+            
+            if len(non_empty_rows) > 0:
+                non_empty_sums = row_sums[non_empty_rows.index]
+                max_deviation = (non_empty_sums - 1.0).abs().max()
+                
+                if max_deviation > 1e-3:
+                    warnings.warn(f"警告: 行合計の最大偏差が許容範囲を超えています: {max_deviation}")
+                else:
+                    print(f"  [OK] 行合計チェック: OK (最大偏差={max_deviation:.2e})")
+            
+            # 各時間帯で合計が≤1を保証
+            hour_bins = self.time_processor.get_hour_bins()
+            max_hourly_violation = 0
+            for hour_bin in hour_bins:
+                bin_cols = [col for col in ratio_cols if f'__{hour_bin}__' in col]
+                hourly_sums = df[bin_cols].sum(axis=1)
+                max_hourly = hourly_sums.max()
+                
+                if max_hourly > 1.0 + 1e-3:
+                    max_hourly_violation = max(max_hourly_violation, max_hourly - 1.0)
+            
+            if max_hourly_violation > 0:
+                warnings.warn(f"警告: 一部の時間帯で合計が1を超えています (最大超過: {max_hourly_violation:.3f})")
 

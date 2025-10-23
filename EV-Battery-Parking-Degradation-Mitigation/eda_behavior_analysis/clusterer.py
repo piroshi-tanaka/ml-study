@@ -69,8 +69,18 @@ class BehaviorPatternClusterer:
             return df
         
         # 特徴量抽出
-        feature_cols = [col for col in df_valid.columns 
-                       if col.startswith('ratio__') or col.startswith('trans_') or col == 'unique_clusters_visited']
+        # TOP-K方式の場合は_ratio列、従来方式の場合はratio__列を使用
+        if self.config.use_topk_per_hour:
+            # TOP-K方式：_ratio列のみ使用（cluster列は除外）
+            ratio_cols = [col for col in df_valid.columns if col.endswith('_ratio')]
+        else:
+            # 従来方式：ratio__列を使用
+            ratio_cols = [col for col in df_valid.columns if col.startswith('ratio__')]
+        
+        trans_cols = [col for col in df_valid.columns 
+                     if col.startswith('trans_') or col == 'unique_clusters_visited']
+        
+        feature_cols = ratio_cols + trans_cols
         X = df_valid[feature_cols].values
         
         # 標準化

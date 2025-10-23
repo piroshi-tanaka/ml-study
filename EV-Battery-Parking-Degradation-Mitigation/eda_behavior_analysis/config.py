@@ -13,7 +13,7 @@ class BehaviorAnalysisConfig:
     
     Attributes:
         hour_bin_size (int): 時間ビンのサイズ（時間単位）。デフォルト: 1
-        topK_clusters (int): 上位K個のクラスタを採用。デフォルト: 20
+        topK_clusters (int): 上位K個のクラスタを採用（use_topk_per_hour=Falseの場合のみ）。デフォルト: 20
         min_session_minutes (int): 最小セッション時間（分）。これより短いセッションは除外可能。デフォルト: 20
         window_months (int): 分析ウィンドウ期間（月）。デフォルト: 3
         day_start_hour (int): 日の開始時刻（06:00基準）。デフォルト: 6
@@ -23,6 +23,8 @@ class BehaviorAnalysisConfig:
         hdbscan_min_samples (int): HDBSCANの最小サンプル数。デフォルト: 3
         include_transition_features (bool): 遷移特徴量を含めるか。デフォルト: True
         topK_transitions (int): 上位K個の遷移パターンを採用。デフォルト: 15
+        use_topk_per_hour (bool): 時間帯ごとのTOP-K方式を使用するか。デフォルト: True
+        topk_per_hour (int): 各時間帯のTOP-K個のクラスタを記録。デフォルト: 3
         random_state (int): 再現性のための乱数シード。デフォルト: 42
         timezone (str): タイムゾーン。デフォルト: 'Asia/Tokyo'
     """
@@ -37,6 +39,8 @@ class BehaviorAnalysisConfig:
     hdbscan_min_samples: int = 3
     include_transition_features: bool = True
     topK_transitions: int = 15
+    use_topk_per_hour: bool = True
+    topk_per_hour: int = 3
     random_state: int = 42
     timezone: str = 'Asia/Tokyo'
 
