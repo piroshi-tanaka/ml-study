@@ -1,0 +1,50 @@
+@startuml
+skinparam shadowing false
+skinparam activity {
+  BackgroundColor #FFFFFF
+  ArrowColor #555555
+  BorderColor #333333
+}
+title データ量に応じた学習の流れ（初心者向け）
+
+start
+:ユーザーが新しく登録／走行開始;
+:これまでにたまったデータ量を確認;
+
+if (データがほとんど無い) then (はい)
+  :Step1 はじめの共通モデル;
+  note right
+    他のユーザー全体の傾向を使う
+    地域・車種・時間帯などの平均を参考にする
+  end note
+elseif (少しデータがある) then (はい)
+  :Step2 少し自分のデータを反映;
+  note right
+    共通モデル＋自分の平均や
+    似たユーザーの傾向を組み合わせる
+  end note
+elseif (データがそこそこある) then (はい)
+  :Step3 自分のパターンを学ぶ;
+  note right
+    共通傾向と自分の傾向をミックス
+    最近の行動も重視
+  end note
+else (十分ある)
+  :Step4 自分専用モデル;
+  note right
+    自分のデータだけで学習
+    行動にぴったり合った予測
+  end note
+endif
+
+:予測の結果をチェック;
+:精度や傾向の変化を確認;
+
+if (モデルを進化させる必要あり？) then (はい)
+  :ステップを昇格または見直し;
+else (いいえ)
+  :今のモデルを継続利用;
+endif
+
+stop
+@enduml
