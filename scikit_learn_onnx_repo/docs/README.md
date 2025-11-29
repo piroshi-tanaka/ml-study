@@ -69,6 +69,24 @@
 
 ---
 
+### [ライブラリ解説: onnxruntime & skl2onnx](./ライブラリ解説_onnxruntime_skl2onnx.md) ⭐ 参考資料
+
+**所要時間**: 読み物（15-20分）
+
+**内容**:
+- ONNXの基本概念
+- skl2onnxの詳細な使い方
+- onnxruntimeの機能とAPI
+- 実践的なコード例
+- よくある質問とトラブルシューティング
+
+**対象**:
+- ライブラリを深く理解したい方
+- カスタマイズや応用を検討している方
+- トラブルシューティングの参考に
+
+---
+
 ## 🚀 クイックスタート
 
 ### 1. Python側（Windows）
@@ -125,7 +143,8 @@ ml-study/
     │   ├── README.md                       # このファイル
     │   ├── 01_Python_ONNX作成手順.md
     │   ├── 02_WSL_Ubuntu_環境構築手順.md
-    │   └── 03_C++推論実行手順.md
+    │   ├── 03_C++推論実行手順.md
+    │   └── ライブラリ解説_onnxruntime_skl2onnx.md  # 参考資料
     │
     └── cpp_inference/                      # C++推論 ★
         ├── CMakeLists.txt                  # ビルド設定
@@ -260,6 +279,13 @@ A:
 ---
 
 ## 🎓 学習リソース
+
+### プロジェクト内ドキュメント
+
+- [ライブラリ解説: onnxruntime & skl2onnx](./ライブラリ解説_onnxruntime_skl2onnx.md) ⭐ 推奨
+  - ONNXの基本概念
+  - ライブラリの詳細な使い方
+  - 実践的なコード例
 
 ### ONNX関連
 
