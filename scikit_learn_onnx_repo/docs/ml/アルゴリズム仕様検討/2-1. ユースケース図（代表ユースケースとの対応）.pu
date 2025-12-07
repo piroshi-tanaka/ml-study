@@ -1,0 +1,30 @@
+@startuml
+left to right direction
+
+actor User as U
+actor "車両ECU" as ECU
+actor "バックエンドML" as BE
+
+rectangle "充電リコメンドシステム" {
+
+  usecase "通常の充電リコメンドを受け取る\n(NORMAL)" as UC_Normal
+  usecase "旅行中の安全側リコメンド\n(TRAVEL)" as UC_Travel
+  usecase "緊急時の充電量レコメンド\n(EMERGENCY_BEFORE_NORMAL)" as UC_Emergency
+  usecase "突発充電時の補助情報\n(OPPORTUNISTIC_CHARGE)" as UC_Opportunistic
+
+  usecase "毎朝のバッチ推論を実行する" as UC_DailyBatch
+  usecase "充電開始前に即時計算する" as UC_OnDemand
+}
+
+U --> UC_Normal
+U --> UC_Travel
+U --> UC_Emergency
+U --> UC_Opportunistic
+
+ECU --> UC_DailyBatch
+ECU --> UC_OnDemand
+
+UC_DailyBatch --> BE
+UC_OnDemand --> BE
+
+@enduml
