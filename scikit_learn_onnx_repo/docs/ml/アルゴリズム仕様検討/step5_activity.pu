@@ -1,0 +1,107 @@
+# 2.3 状態遷移図（復帰条件付き）
+@startuml
+skinparam shadowing false
+
+start
+
+:トリガー種別を取得\n(朝一バッチ/通常イベント/\n突発充電/今から充電/緊急SOC低下);
+
+if (トリガー種別は？) then (通常バッチ/通常イベント)
+  :推論モード = NORMAL;
+elseif (突発充電/今から充電)
+  :推論モード = OPPORTUNISTIC_CHARGE;
+else (緊急(SOC低下))
+  :推論モード = EMERGENCY_BEFORE_NORMAL;
+endif
+
+:次々回までの充電タイミングを予測\n(次回充電タイミング, 次々回充電タイミング);
+
+:次々回までの消費SOCを予測\n(次回まで/次々回まで/途中候補ごと);
+
+if (現在SOC - 次々回までの消費SOC >= SOC下限) then (CaseA)
+  :次回スキップ可と判定;
+  :次々回の充電タイミングで\n次々回まで到達可能な\n必要充電量を算出;
+elseif (現在SOC - 次回までの消費SOC >= SOC下限) then (CaseB)
+  :次回までは到達可だが\n次々回までは不足と判定;
+  :次回の充電タイミングで\n次々回まで到達可能な\n必要充電量を算出;
+else (CaseC)
+  :次回までも到達困難と判定;
+  :SOCが下限を割る前に\n現実的な充電タイミング候補を列挙;
+  :各候補ごとに\n必要充電量(候補)を算出;
+endif
+
+:推論モードごとのポリシー適用\n- NORMAL: スキップ案も含めバランス提示\n- OPPORTUNISTIC: 今回充電量の最適化を優先\n- EMERGENCY: 不足回避プランのみ許容;
+
+:バッテリ負荷観点も加味して\n(高SOC長時間放置の回避など)\n候補プランをスコアリング;
+
+:ユーザーにレコメンド送信\n- スキップ案\n- 充電タイミング案\n- 各案の推奨充電量;
+
+:ユーザー行動(採用/無視)と\n推奨との差分をログ記録;
+
+stop
+@enduml
+
+# 2.4 復帰シナリオシーケンス図①（旅行 → NORMAL 復帰）
+@startuml
+actor ユーザー
+participant "車両/車載システム" as Vehicle
+participant "充電リコメンドシステム" as Reco
+
+== 旅行開始 ==
+ユーザー -> Vehicle : 長距離ドライブ開始
+Vehicle -> Reco : 走行ログ送信(距離/位置)
+Reco -> Reco : 長距離/未知クラスタを検知\nstate = TRAVEL
+
+== 旅行中 ==
+ユーザー -> Vehicle : サービスエリアで充電開始
+Vehicle -> Reco : 充電開始イベント
+Reco -> Reco : state=TRAVEL + 突発充電判定\nstate = OPPORTUNISTIC_CHARGE
+Reco -> Reco : 共通フロー実行(CaseA/B/C)\n旅行中ポリシーで安全寄りプラン選択
+Reco -> Vehicle : 充電タイミング/量の推奨送信
+
+ユーザー -> Vehicle : 推奨に従う or 無視して充電
+Vehicle -> Reco : 実績SOC/充電量を送信
+Reco -> Reco : 推奨との差分をログ記録\nstateは TRAVEL に戻る
+
+== 帰宅 ==
+ユーザー -> Vehicle : 自宅クラスタに帰宅し夜間駐車
+Vehicle -> Reco : 位置/駐車ログ送信(自宅クラスタ, 夜間)
+Reco -> Reco : 自宅クラスタでの夜間駐車日数をカウント
+Reco -> Reco : 連続2日以上なら\nstate = NORMAL に復帰
+
+== 通常運用再開 ==
+Vehicle -> Reco : 朝一バッチトリガー
+Reco -> Reco : state=NORMAL として\n通常の次々回までロジック(CaseA/B/C)を実行
+Reco -> Vehicle : スキップ/充電プランを通常運用として送信
+
+@enduml
+
+
+# 2.5 復帰シナリオシーケンス図②（緊急 → NORMAL/TRAVEL 復帰）
+@startuml
+actor ユーザー
+participant "車両/車載システム" as Vehicle
+participant "充電リコメンドシステム" as Reco
+
+== 緊急検知 ==
+Vehicle -> Reco : SOC低下イベント送信\n(予測より大きく低下)
+Reco -> Reco : 現在stateを確認(NORMAL or TRAVEL)
+Reco -> Reco : state = EMERGENCY_BEFORE_NORMAL に遷移
+
+== 緊急プラン計算 ==
+Reco -> Reco : 共通フロー実行\n(緊急モードとして CaseB/C 中心)
+Reco -> Reco : 次回/次々回/その他候補ごとの\n不足リスクを評価
+Reco -> Vehicle : 「不足回避を最優先した\n充電タイミング/量プラン」を送信
+
+== 緊急充電 ==
+ユーザー -> Vehicle : 推奨に従って充電開始\n(あるいは近いプランで充電)
+Vehicle -> Reco : 充電開始/終了イベント\nおよび充電後SOCを送信
+Reco -> Reco : 推奨との差分をログ記録
+
+== 復帰先判定 ==
+Reco -> Reco : 現在位置/走行パターンを確認
+Reco -> Reco : 
+  - 自宅クラスタ/通常パターン復帰 → state = NORMAL
+  - 旅行パターン継続 → state = TRAVEL
+
+@enduml
