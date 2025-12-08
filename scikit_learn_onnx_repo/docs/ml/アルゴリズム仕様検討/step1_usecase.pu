@@ -1,0 +1,97 @@
+@startuml
+left to right direction
+skinparam packageStyle rectangle
+
+actor "ユーザー" as User
+actor "車両/車載システム" as Vehicle
+actor "モバイルアプリ" as App
+
+rectangle "充電リコメンドシステム" {
+
+  ' 基本ユースケース：タイミング＋量
+  usecase "通常充電タイミングと\n充電量をレコメンドする" as UC_NormalRecommend
+
+  ' 緊急系：予定より早くSOCが危険になった場合
+  usecase "SOC低下時の\n緊急充電量をレコメンドする" as UC_EmergencyRecommend
+
+  ' 突発充電系：ユーザーが任意タイミングでプラグインした場合
+  usecase "突発充電時の\n充電量をレコメンドする" as UC_OpportunisticRecommend
+
+  ' オンデマンド問い合わせ（アプリからの明示リクエスト）
+  usecase "今から充電する前に\nおすすめ充電量を問い合わせる" as UC_OnDemandQuery
+
+  ' ユーザーがリコメンドに従わなかった場合のシステム側処理
+  usecase "リコメンド無視時の\nログ記録と再評価" as UC_IgnoreHandle
+
+  ' イベント/バッチトリガーによる推論実行
+  usecase "毎朝のバッチ推論を\n実行する" as UC_DailyBatch
+  usecase "充電/走行イベント時に\n再評価を実行する" as UC_EventRecalc
+}
+
+' --- アクターとユースケースの関係 ---
+
+' ユーザー：リコメンド結果を受け取り、オンデマンドで問い合わせも行う
+User --> UC_NormalRecommend
+User --> UC_OpportunisticRecommend
+User --> UC_OnDemandQuery
+
+' ユーザーの自由行動（リコメンド無視）をトリガーとして扱う
+User -down-> UC_IgnoreHandle : 「リコメンドを無視して\n充電/スキップ」
+User -- UC_IgnoreHandle
+note right of UC_IgnoreHandle
+   ユーザーがリコメンドに従わずに
+   - 充電推奨を無視してスキップ
+   - スキップ推奨を無視して充電
+   した場合に、このユースケースが起動する。
+end note
+
+
+' 車両/車載システム：データ提供・イベントトリガーの主体
+Vehicle --> UC_DailyBatch
+Vehicle --> UC_EventRecalc
+
+' 緊急充電レコメンドは\nSOC低下イベントから起動
+Vehicle --> UC_EmergencyRecommend : 「SOC低下イベント」
+
+' 突発充電レコメンドは\n充電開始イベントから起動
+Vehicle --> UC_OpportunisticRecommend : 「充電開始イベント\n(予定外タイミング)」
+
+' モバイルアプリ：UIチャネル（結果の表示＋ユーザー操作）
+App --> UC_NormalRecommend
+App --> UC_OpportunisticRecommend
+App --> UC_OnDemandQuery
+
+' --- 内部関係（include / extend） ---
+
+' バッチ/イベントは通常レコメンド等を内包
+UC_DailyBatch ..> UC_NormalRecommend        : <<include>>
+UC_EventRecalc ..> UC_NormalRecommend       : <<include>>
+UC_EventRecalc ..> UC_EmergencyRecommend    : <<include>>
+UC_EventRecalc ..> UC_OpportunisticRecommend : <<include>>
+
+' オンデマンド問い合わせは\n「今この場での充電量レコメンド」を拡張
+UC_OnDemandQuery ..> UC_OpportunisticRecommend : <<extend>>
+
+' リコメンド無視時の処理は、再評価を内包
+UC_IgnoreHandle ..> UC_EventRecalc : <<include>>
+
+note right of UC_EmergencyRecommend
+  車両側でSOC低下イベントを検知した場合に、
+  - 次の通常充電タイミング
+  - あるいは次々回まで
+  をカバーするための必要充電量を
+  安全側のマージン付きで算出する。
+  主トリガーは「車両の状態変化」。
+end note
+
+note right of UC_OpportunisticRecommend
+  ユーザーが「予定外のタイミング」で
+  すでに充電を始めようとした場合、
+  - その場のSOC
+  - 今後の利用予定
+  を踏まえて「今どれだけ充電すべきか」を算出する。
+  主トリガーは「充電開始イベント」または
+  アプリからの「今から充電」問い合わせ。
+end note
+
+@enduml
