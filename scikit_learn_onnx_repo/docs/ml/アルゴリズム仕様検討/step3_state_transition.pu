@@ -1,0 +1,89 @@
+@startuml
+skinparam shadowing false
+
+'====================================
+' 内部モードの状態遷移図
+'====================================
+
+[*] --> COLD_START : 新規ユーザー\n個別データ不足
+
+state "COLD_START\n(データ不足)" as COLD_START
+state "NORMAL\n(通常習慣ベース)" as NORMAL
+state "TRAVEL\n(旅行・イレギュラー)" as TRAVEL
+state "EMERGENCY_BEFORE_NORMAL\n(通常充電前の緊急不足)" as EMERGENCY
+state "OPPORTUNISTIC_CHARGE\n(突発充電セッション)" as OPPORTUNISTIC
+
+note right of COLD_START
+  ・個別の習慣がまだ学習できていない状態
+  ・共通モデル／ルールベース中心で保守的に運用
+  ・スキップリコメンドは原則抑制
+end note
+
+note right of NORMAL
+  ・曜日/時間帯/場所ごとの通常充電タイミングを学習済み
+  ・「次回/次々回までの到達可否」を判定し、
+    スキップ or 充電タイミング＋量をリコメンド
+end note
+
+note right of TRAVEL
+  ・長距離走行や未知クラスタ滞在など、
+    普段と大きく異なるパターンを検知した状態
+  ・スキップリコメンドを抑制し、
+    安全側の充電提案を優先
+end note
+
+note right of EMERGENCY
+  ・本来の次回通常充電タイミングの前に
+    SOC下限割れ予測 or SOC低下イベントが発生
+  ・不足を起こさないことを最優先に、
+    できるだけ早い充電と必要量をリコメンド
+end note
+
+note right of OPPORTUNISTIC
+  ・いつもの習慣と異なるタイミング/場所で
+    ユーザーが充電を開始した状態
+  ・タイミングは「今」に固定し、
+    今回の充電量のみを最適化
+  ・学習時は習慣モデルへの影響を小さめに扱う
+end note
+
+'------------------------------------
+' COLD_START からの遷移
+'------------------------------------
+COLD_START --> NORMAL : 個別データが一定量蓄積\n(充電/走行履歴が十分揃う)
+COLD_START --> TRAVEL : データ不足だが長距離走行など\nイレギュラーパターンを検知\n(安全側にTRAVELとして扱う)
+
+'------------------------------------
+' NORMAL と TRAVEL 間の遷移
+'------------------------------------
+NORMAL --> TRAVEL : 長距離走行/未知クラスタ滞在\n普段と異なる走行パターンを連続検知
+TRAVEL --> NORMAL : 自宅クラスタでの夜間長時間駐車が\n複数日続く 等\n「習慣パターンへの復帰」を検知
+
+'------------------------------------
+' NORMAL/TRAVEL から EMERGENCY への遷移
+'------------------------------------
+NORMAL --> EMERGENCY : 次回通常充電前に\nSOC下限割れ予測 or SOC低下イベント
+TRAVEL --> EMERGENCY : 旅行中にSOC低下イベント\n(予測より大きな消費)
+
+' 緊急充電後の復帰
+EMERGENCY --> NORMAL : 緊急充電完了後\n自宅周辺での通常パターンに復帰
+EMERGENCY --> TRAVEL : 緊急充電後も\n旅行パターンが継続
+
+'------------------------------------
+' OPPORTUNISTIC との遷移
+'------------------------------------
+NORMAL --> OPPORTUNISTIC : 予定外タイミングでの充電開始\nまたは「今から充電」ボタン押下
+TRAVEL --> OPPORTUNISTIC : 旅行中のサービスエリア等で\n突発的に充電開始
+
+OPPORTUNISTIC --> NORMAL : 充電セッション終了後、\n自宅クラスタに戻り\n通常パターンが継続
+OPPORTUNISTIC --> TRAVEL : 充電セッション終了後も\n長距離移動や未知クラスタ滞在が継続
+
+'------------------------------------
+' モデルリセット等によるCOLD_STARTへの戻り（任意）
+'------------------------------------
+NORMAL --> COLD_START : モデルリセット/大規模設定変更
+TRAVEL --> COLD_START : モデルリセット/大規模設定変更
+EMERGENCY --> COLD_START : モデルリセット/大規模設定変更
+OPPORTUNISTIC --> COLD_START : モデルリセット/大規模設定変更
+
+@enduml
