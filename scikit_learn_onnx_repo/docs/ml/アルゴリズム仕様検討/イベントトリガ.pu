@@ -1,0 +1,36 @@
+@startuml
+title 2. Event Handler Trigger (プラグ接続・ユーザー操作)
+
+start
+:トリガー: 充電プラグ接続 or ユーザー操作で推奨リクエスト;
+
+:車載ECU: コンテキストとステータスを判定;
+if (コンテキスト == DAILY & 計画通り充電) then (DAILY - 習慣)
+  :サーバーへ詳細予測を要求;
+  :ML予測 $\Delta \text{SOC}$ を取得;
+
+  :レベル2: 安全マージン評価;
+  if (SOC - $\Delta \text{SOC}$ > 安全閾値?) then (GREEN)
+    :リコメンドロジック: 劣化抑制優先;
+    :レベル3アクション: スキップ or 上限SOC提案;
+    :行動をDAILY学習データとして記録(強化);
+  else (YELLOW/RED)
+    :リコメンドロジック: 安全マージン確保;
+    :レベル3アクション: 満充電を推奨/指令;
+  endif
+
+else if (コンテキスト == DAILY & 突発的充電) then (DAILY - 突発)
+  :車載ECU: 現在SOCが十分か評価;
+  if (十分である) then (スキップ可能)
+    :レベル3アクション: スキップを提案 (過充電抑制);
+  else (必要あり)
+    :レベル3アクション: 許容/満充電を提案;
+  endif
+  :行動を学習データから除外;
+
+else (TRAVEL/COLD_START)
+  :レベル3アクション: TRAVEL/COLD_STARTロジックを適用 (必要充電量 or 保守的);
+endif
+
+stop
+@enduml
