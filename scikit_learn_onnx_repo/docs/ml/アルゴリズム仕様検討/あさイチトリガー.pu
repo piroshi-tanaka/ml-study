@@ -1,0 +1,33 @@
+@startuml
+title 1. Planner Trigger (朝一・習慣予測)
+
+start
+:トリガー: 朝一バッチ実行 (例: 04:00 AM) または初回乗車イベント;
+:コンテキスト判定 (DAILY, TRAVEL, COLD_START);
+
+if (コンテキスト == DAILY) then (DAILY)
+  :サーバー: 機械学習モデル (LightGBM/Prophet) 実行;
+  :予測 $T_{\text{charge}}$ (次々回タイミング) および $\Delta \text{SOC}$ (次々回までの消費量);
+  
+  :レベル2: 安全マージン評価;
+  if (SOC - $\Delta \text{SOC}$ > 安全閾値?) then (GREEN)
+    :リコメンドロジック: バッテリ劣化抑制を優先;
+    :レベル3アクション: スキップ or 上限SOCを提案;
+  else (YELLOW/RED)
+    :リコメンドロジック: 安全マージン確保を優先;
+    :レベル3アクション: スキップ非推奨 or 即時充電指令;
+  endif
+  :結果を車載ECUへ送信・表示準備;
+
+else if (コンテキスト == TRAVEL) then (TRAVEL)
+  :サーバー: ナビ情報・一般走行モデルで予測;
+  :レベル3アクション: 目的地到達に必要な充電量を提案;
+
+else (COLD_START)
+  :サーバー: 初期ルールベースを適用;
+  :レベル3アクション: 保守的な充電を提案;
+
+endif
+
+stop
+@enduml
