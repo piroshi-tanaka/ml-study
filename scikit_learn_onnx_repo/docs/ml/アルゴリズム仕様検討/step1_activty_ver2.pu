@@ -1,0 +1,144 @@
+@startuml
+title EVスマート充電リコメンドフロー (完全連結版)
+
+' スタイル定義
+skinparam activity {
+  BackgroundColor<<ML>> PaleGreen
+  BackgroundColor<<Logic>> LightSkyBlue
+  BackgroundColor<<Warning>> Orange
+  BackgroundColor<<Critical>> LightCoral
+  BackgroundColor<<Safe>> LightCyan
+  BorderColor DimGray
+  ArrowColor DimGray
+  FontName "Meiryo"
+}
+
+partition "1. データ入力 & AI予測" {
+  start
+  :トリガー発生;
+  
+  fork
+    :【MLモデル1】
+    **充電プラグ接続状態予測 (時系列分類)**;
+    :積分計算:
+    **「時間内最大充電可能量」**;
+  fork again
+    :【MLモデル2】
+    **消費SOC予測**;
+    :予測結果:
+    **「次回消費量」**
+    **「GREEN復帰目標値 (次回+次々回)」**;
+  end fork
+}
+
+partition "2. 状態判定とリコメンド分岐" <<Logic>> {
+
+  ' ==========================================
+  ' 第一関門: 生存確認 (RED判定)
+  ' ==========================================
+  note right
+    【第1関門: 生存確認】
+    まずは「次の目的地」に
+    到達できるかチェック
+  end note
+
+  if (**現在のSOC** < **次回消費量**) then (<color:red>Yes: RED (次回届かない)</color>)
+    
+    if (**現在SOC** + **時間内最大充電可能量** < **次回消費量**) then (No: 時間一杯入れても届かない)
+      :【シナリオC-3: 到達不可・延長提案】
+      ステータス: <color:red>**RED継続 (失敗)**</color>;
+      partition "代替案の提示" <<Critical>> {
+        :不足電力量を計算;
+        :YELLOW復帰に必要な追加時間を算出;
+        :「このままでは到達できません。
+         あとXX分延長して充電するか、
+         経路充電を計画してください」と提案;
+      }
+      stop
+    else (Yes: 時間内で次回には届く)
+      :RED脱出 (生存確保);
+      note left
+        とりあえず次回到達は可能。
+        続けて「次々回」の判定へ進む
+        (YELLOW/GREEN判定へ合流)
+      end note
+    endif
+
+  else (No: 次回は届く)
+    :生存OK;
+  endif
+
+  ' ==========================================
+  ' 第二関門: 効率性・時間確認 (YELLOW判定)
+  ' ==========================================
+  note right
+    【第2関門: 時間制約チェック】
+    ここからはRED脱出組も合流。
+    「次々回」まで届くかチェック
+  end note
+
+  ' RED脱出組も、もともとYELLOWの組も、ここでまとめて判定
+  if (**現在のSOC** < **GREEN復帰目標値**) then (<color:orange>Yes: 次々回までは不足</color>)
+
+    ' 時間制約チェック
+    if (**現在SOC** + **時間内最大充電可能量** < **GREEN復帰目標値**) then (No: 時間が足りない)
+      :【シナリオB-2 / C-2 (時間切れ)】
+      ステータス: <color:orange>**YELLOW確定 (なりゆき)**</color>;
+      :充電目標 = **時間内最大充電可能量 (Full)**;
+      partition "結果通知" <<Warning>> {
+        :「時間が短いため満タンになりません。
+         (現在SOC + 追加分) まで回復します。
+         次の目的地で充電が必要です」;
+      }
+      stop
+    else (Yes: 時間は足りる)
+       note left
+         時間は十分ある。
+         最後に「劣化制約」を確認
+       end note
+    endif
+
+    ' ==========================================
+    ' 第三関門: 劣化制約確認 (SOC上限)
+    ' ==========================================
+    note right
+      【第3関門: 劣化制約チェック】
+      目標まで入れると
+      劣化上限(80%等)を超えるか？
+    end note
+
+    if (**GREEN復帰目標値** > **劣化抑制上限SOC**) then (Yes: 上限に引っかかる)
+      :【シナリオB-2 / C-2 (劣化考慮)】
+      ステータス: <color:orange>**YELLOW継続 (意図的)**</color>;
+      :充電目標 = **劣化抑制上限SOC (80%)**;
+      partition "劣化抑制メッセージ" {
+        :「次々回には届きませんが、
+         バッテリー保護のため
+         上限(80%)で止めます」;
+      }
+    else (No: 上限内)
+      :【シナリオB-1 / C-1 (完全回復)】
+      ステータス: <color:green>**GREENへ復帰**</color>;
+      :充電目標 = **GREEN復帰目標値**;
+      note right
+        「最適量まで充電します。
+        次々回まで安心です」
+      end note
+    endif
+    stop
+
+  ' ==========================================
+  ' そもそもGREEN (余裕あり)
+  ' ==========================================
+  else (No: 最初からGREEN)
+    :【シナリオA: 充電スキップ】;
+    partition "スキップ提案" <<Safe>> {
+      :充電目標 = **0 (待機)**;
+      :「充電不要です。
+      バッテリーを休ませましょう」;
+    }
+    stop
+  endif
+
+}
+@enduml
