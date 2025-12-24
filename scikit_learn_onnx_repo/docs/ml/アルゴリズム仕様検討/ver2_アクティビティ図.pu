@@ -1,0 +1,107 @@
+@startuml
+skinparam activity {
+  BackgroundColor<<ML>> LightBlue
+  BorderColor<<ML>> DeepSkyBlue
+  BackgroundColor<<Logic>> LightYellow
+  BorderColor<<Logic>> Orange
+  BackgroundColor<<Calc>> Pink
+  BorderColor<<Calc>> Red
+  BackgroundColor<<Alert>> Red
+  BorderColor<<Alert>> DarkRed
+  FontColor<<Alert>> White
+}
+
+title 3点予測・ダブルクリップ（劣化＆時間）型 充電リコメンドフロー
+
+|#LightGray|ユーザー/車両|
+start
+:トリガ検知;
+
+|システム (Controller)|
+:データ取得 & ML予測;
+:シミュレーション実行;
+
+if (予測期間内にSOCが下限(10%)を割るか？) then (いいえ)
+    :推奨アクション = "充電不要 (スキップ)";
+    stop
+else (はい)
+    :下限を割る直前の機会を\n**「充電ターゲットポイント」**と特定;
+
+    ' --- 到達不可チェック ---
+    if (現在のSOCでターゲットまで届くか？) then (いいえ)
+        |#MistyRose|緊急判定|
+        :【緊急】ターゲットに届かないため\n今すぐ最寄りで充電が必要;
+        stop
+    else (はい)
+        |システム (Controller)|
+        if (ターゲットは「現在」か？) then (いいえ)
+            :推奨アクション = "充電不要";
+            stop
+        else (はい: 今充電すべき)
+            partition "推奨充電量の計算ロジック" {
+                |#LightYellow|計算ロジック|
+                :【A】**Must要件（最低到達SOC）**の算出
+                --------------------------------
+                目標到達SOC = (次回機会までの消費量 + 10%バッファ)
+                **必要充電量 = 目標到達SOC - 現在SOC**;
+
+                :【B】**Future負債（リカバリ必要量）**の算出
+                --------------------------------
+                次回機会の時間内で、その次（次々回）へ
+                行くための電力が賄えるか判定;
+                
+                if (次回機会で時間が足りない？) then (はい)
+                    :不足分を今回上乗せする;
+                    :仮の目標SOC = 目標到達SOC + 不足分;
+                else (いいえ)
+                    :仮の目標SOC = 目標到達SOC;
+                endif
+
+                :【C】**クリップ処理1：バッテリー劣化上限**
+                --------------------------------
+                (Must要件が70%を超えている場合を除く);
+                
+                if (仮の目標SOC > 70% かつ Must要件 <= 70%) then (はい)
+                    :推奨目標SOC = 70%;
+                    note right
+                      劣化抑制優先のため
+                      未来の負債返済を諦め
+                      70%でキャップ
+                    end note
+                else (いいえ)
+                    :推奨目標SOC = 仮の目標SOC;
+                endif
+
+                :【D】**クリップ処理2：今回の時間上限**
+                --------------------------------
+                今回のターゲットポイントにおける
+                滞在時間と出力から物理限界を算出;
+
+                if (推奨目標SOC > 今回の時間内到達可能SOC) then (はい)
+                    :推奨目標SOC = 今回の時間内到達可能SOC;
+                    note right
+                      **時間制約優先**
+                      これ以上は物理的に
+                      充電できないためカット
+                    end note
+                else (いいえ)
+                    :推奨目標SOCはそのまま維持;
+                endif
+            }
+        endif
+    endif
+endif
+
+|#LightGray|ユーザー/車両|
+:リコメンド結果(推奨目標SOC)の提示;
+
+if (推奨値が【C】または【D】で削られたか？) then (はい)
+    :注意メッセージ表示;
+    note right
+      「時間制約/保護のためXX%までとします。
+       次回充電時に調整が必要です」
+    end note
+endif
+
+stop
+@enduml
